@@ -69,6 +69,15 @@ from . import target_lpc4088qsb
 from . import target_lpc4088dm
 from . import target_RTL8195AM
 from . import target_CC3220SF
+from . import target_STM32F031xx
+from . import target_STM32F051xx
+from . import target_STM32F071xx
+from . import target_STM32F301xx
+from . import target_STM32F405xx
+from . import target_STM32F415xx
+from . import target_STM32L486xx
+
+
 
 TARGET = {
           'cortex_m': CoreSightTarget,
@@ -111,7 +120,7 @@ TARGET = {
           'nrf52' : target_nRF52832_xxAA.NRF52,
           'nrf52840' : target_nRF52840_xxAA.NRF52840,
           'stm32f103rc': target_STM32F103RC.STM32F103RC,
-          'stm32f051': target_STM32F051T8.STM32F051,
+          #'stm32f051': target_STM32F051T8.STM32F051,
           'stm32f412xe' : target_STM32F412xx.STM32F412xE,
           'stm32f412xg' : target_STM32F412xx.STM32F412xG,
           'stm32f439xg' : target_STM32F439xx.STM32F439xG,
@@ -131,5 +140,12 @@ TARGET = {
           'lpc4088dm': target_lpc4088dm.LPC4088dm,
           'rtl8195am': target_RTL8195AM.RTL8195AM,
           'cc3220sf': target_CC3220SF.CC3220SF,
+          'stm32f031e6': target_STM32F031xx.STM32F031E6,
+          'stm32f051t8': target_STM32F051xx.STM32F051T8,
+          'stm32f071cb': target_STM32F071xx.STM32F071CB,
+          'stm32f301k8': target_STM32F301xx.STM32F301K8,
+          'stm32f405og': target_STM32F405xx.STM32F405OG,
+          'stm32f415og': target_STM32F415xx.STM32F415OG,
+          'stm32l486jg': target_STM32L486xx.STM32L486JG,
          }
 
