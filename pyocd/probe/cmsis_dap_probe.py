@@ -350,6 +350,33 @@ class CMSISDAPProbe(DebugProbe):
         # Invalidate cached DP SELECT register.
         self._dp_select = -1
 
+    def get_unique_id(self):
+        return self._link.get_unique_id()
+
+    def get_cpu_type(self):
+        buf = self._link.vendor(28)
+        if buf[0] == 1:
+            return buf[1]
+        else:
+            return 0xFF 
+
+    def get_full_unique_id(self):
+        buf = self._link.vendor(29)
+        return buf[1: (buf[0] + 1)]
+
+    def get_gpios(self):
+        buf = self._link.vendor(30)
+        if buf[0] == 2:
+            return buf[1] | (buf[2] << 8)
+        else:
+            return 0
+
+    def identification(self, time = 3000):
+        buf = bytearray(2)
+        buf[0] =  time       & 0xff
+        buf[1] = (time >> 8) & 0xff
+        return self._link.vendor(31)
+
     @staticmethod
     def _convert_exception(exc):
         if isinstance(exc, DAPAccess.TransferFaultError):
