@@ -353,6 +353,10 @@ class CMSISDAPProbe(DebugProbe):
     def get_unique_id(self):
         return self._link.get_unique_id()
 
+    def get_target_unique_id(self):
+        buf = self._link.vendor(27)
+        return buf[1: (buf[0] + 1)]
+
     def get_cpu_type(self):
         buf = self._link.vendor(28)
         if buf[0] == 1:
