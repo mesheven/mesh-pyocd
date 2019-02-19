@@ -76,7 +76,7 @@ from . import target_STM32F301xx
 from . import target_STM32F405xx
 from . import target_STM32F415xx
 from . import target_STM32L486xx
-
+from . import target_LPC11U35
 
 
 TARGET = {
@@ -147,5 +147,6 @@ TARGET = {
           'stm32f405og': target_STM32F405xx.STM32F405OG,
           'stm32f415og': target_STM32F415xx.STM32F415OG,
           'stm32l486jg': target_STM32L486xx.STM32L486JG,
+          'lpc11u35'   : target_LPC11U35.LPC11U35,
          }
 
