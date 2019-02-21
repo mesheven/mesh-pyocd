@@ -112,6 +112,7 @@ BOARD_ID_TO_INFO = {
     "2020": BoardInfo(  "MB00YY",               "stm32f071cb",        "l1_stm32f071.bin",     ),
     "2030": BoardInfo(  "MB00TT",               "stm32f031e6",        "l1_stm32f031.bin",     ),
     "2040": BoardInfo(  "MB2001/MB3001/MB4001", "stm32l486jg",        "l1_stm32l486.bin",     ),
-    "2050": BoardInfo(  "MB00QQ",               "stm32f301k8",        "l1_stm32f301.bin",     ),    
+    "2050": BoardInfo(  "MB00QQ",               "stm32f301k8",        "l1_stm32f301.bin",     ),
+    "2060": BoardInfo(  "MB0017",               "lpc11u35",           "l1_lpc11u35.bin",      ),        
     }
 
