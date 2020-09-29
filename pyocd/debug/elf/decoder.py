@@ -1,19 +1,18 @@
-"""
- mbed CMSIS-DAP debugger
- Copyright (c) 2017 ARM Limited
-
- Licensed under the Apache License, Version 2.0 (the "License");
- you may not use this file except in compliance with the License.
- You may obtain a copy of the License at
-
-     http://www.apache.org/licenses/LICENSE-2.0
-
- Unless required by applicable law or agreed to in writing, software
- distributed under the License is distributed on an "AS IS" BASIS,
- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- See the License for the specific language governing permissions and
- limitations under the License.
-"""
+# pyOCD debugger
+# Copyright (c) 2017 Arm Limited
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 import sys
 import os
@@ -23,6 +22,8 @@ from intervaltree import IntervalTree
 from collections import namedtuple
 from itertools import islice
 import logging
+
+LOG = logging.getLogger(__name__)
 
 FunctionInfo = namedtuple('FunctionInfo', 'name subprogram low_pc high_pc')
 LineInfo = namedtuple('LineInfo', 'cu filename dirname line')
@@ -105,20 +106,19 @@ class DwarfAddressDecoder(object):
     def __init__(self, elf):
         assert isinstance(elf, ELFFile)
         self.elffile = elf
+        self.dwarfinfo = None
 
-        if not self.elffile.has_dwarf_info():
-            raise Exception("No DWARF debug info available")
+        self.subprograms = []
+        self.function_tree = IntervalTree()
+        self.line_tree = IntervalTree()
 
-        self.dwarfinfo = self.elffile.get_dwarf_info()
+        if self.elffile.has_dwarf_info():
+            self.dwarfinfo = self.elffile.get_dwarf_info()
 
-        self.subprograms = None
-        self.function_tree = None
-        self.line_tree = None
-
-        # Build indices.
-        self._get_subprograms()
-        self._build_function_search_tree()
-        self._build_line_search_tree()
+            # Build indices.
+            self._get_subprograms()
+            self._build_function_search_tree()
+            self._build_line_search_tree()
 
     def get_function_for_address(self, addr):
         try:
@@ -133,12 +133,10 @@ class DwarfAddressDecoder(object):
             return None
 
     def _get_subprograms(self):
-        self.subprograms = []
         for CU in self.dwarfinfo.iter_CUs():
             self.subprograms.extend([d for d in CU.iter_DIEs() if d.tag == 'DW_TAG_subprogram'])
 
     def _build_function_search_tree(self):
-        self.function_tree = IntervalTree()
         for prog in self.subprograms:
             try:
                 name = prog.attributes['DW_AT_name'].value
@@ -147,6 +145,9 @@ class DwarfAddressDecoder(object):
 
                 # Skip subprograms excluded from the link.
                 if low_pc == 0:
+                    continue
+                # Skip empty subprograms (no null intervals are allowed).
+                if low_pc == high_pc:
                     continue
 
                 # If high_pc is not explicitly an address, then it's an offset from the
@@ -161,7 +162,6 @@ class DwarfAddressDecoder(object):
                 pass
 
     def _build_line_search_tree(self):
-        self.line_tree = IntervalTree()
         for cu in self.dwarfinfo.iter_CUs():
             lineprog = self.dwarfinfo.line_program_for_CU(cu)
             prevstate = None
@@ -182,19 +182,27 @@ class DwarfAddressDecoder(object):
 
                 # Looking for a range of addresses in two consecutive states.
                 if prevstate and not skipThisSequence:
-                    fileinfo = lineprog['file_entry'][prevstate.file - 1]
-                    filename = fileinfo.name
-                    dirname = lineprog['include_directory'][fileinfo.dir_index - 1]
+                    try:
+                        fileinfo = lineprog['file_entry'][prevstate.file - 1]
+                        filename = fileinfo.name
+                        try:
+                            dirname = lineprog['include_directory'][fileinfo.dir_index - 1]
+                        except IndexError:
+                            dirname = ""
+                    except IndexError:
+                        filename = ""
+                        dirname = ""
                     info = LineInfo(cu=cu, filename=filename, dirname=dirname, line=prevstate.line)
                     fromAddr = prevstate.address
                     toAddr = entry.state.address
                     try:
                         if fromAddr != 0 and toAddr != 0:
+                            # Ensure we don't insert null intervals.
                             if fromAddr == toAddr:
                                 toAddr += 1
                             self.line_tree.addi(fromAddr, toAddr, info)
                     except:
-                        logging.debug("Problematic lineprog:")
+                        LOG.debug("Problematic lineprog:")
                         self._dump_lineprog(lineprog)
                         raise
 
@@ -208,9 +216,9 @@ class DwarfAddressDecoder(object):
         for i, e in enumerate(lineprog.get_entries()):
             s = e.state
             if s is None:
-                logging.debug("%d: cmd=%d ext=%d args=%s", i, e.command, int(e.is_extended), repr(e.args))
+                LOG.debug("%d: cmd=%d ext=%d args=%s", i, e.command, int(e.is_extended), repr(e.args))
             else:
-                logging.debug("%d: %06x %4d stmt=%1d block=%1d end=%d file=[%d]%s", i, s.address, s.line, s.is_stmt, int(s.basic_block), int(s.end_sequence), s.file, lineprog['file_entry'][s.file-1].name)
+                LOG.debug("%d: %06x %4d stmt=%1d block=%1d end=%d file=[%d]%s", i, s.address, s.line, s.is_stmt, int(s.basic_block), int(s.end_sequence), s.file, lineprog['file_entry'][s.file-1].name)
 
     def dump_subprograms(self):
         for prog in self.subprograms:
@@ -224,6 +232,6 @@ class DwarfAddressDecoder(object):
             except KeyError:
                 high_pc = 0xffffffff
             filename = os.path.basename(prog._parent.attributes['DW_AT_name'].value.replace('\\', '/'))
-            logging.debug("%s%s%08x %08x %s", name, (' ' * (50-len(name))), low_pc, high_pc, filename)
+            LOG.debug("%s%s%08x %08x %s", name, (' ' * (50-len(name))), low_pc, high_pc, filename)
 
 

@@ -1,31 +1,31 @@
-"""
- mbed CMSIS-DAP debugger
- Copyright (c) 2016 ARM Limited
-
- Licensed under the Apache License, Version 2.0 (the "License");
- you may not use this file except in compliance with the License.
- You may obtain a copy of the License at
-
-     http://www.apache.org/licenses/LICENSE-2.0
-
- Unless required by applicable law or agreed to in writing, software
- distributed under the License is distributed on an "AS IS" BASIS,
- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- See the License for the specific language governing permissions and
- limitations under the License.
-"""
+# pyOCD debugger
+# Copyright (c) 2016 Arm Limited
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 from .provider import (TargetThread, ThreadProvider)
-from ..debug.context import DebugContext
-from ..coresight.cortex_m import (CORE_REGISTER, register_name_to_index)
 from ..core import exceptions
 import logging
 
-LIST_NODE_NEXT_OFFSET = 0
-LIST_NODE_OBJ_OFFSET= 8
+LOG = logging.getLogger(__name__)
 
-## @brief Reads a null-terminated C string from the target.
+## Mask on EXC_RETURN indicating whether space for FP registers is allocated
+# on the frame. The bit is 0 if the frame is extended.
+EXC_RETURN_EXT_FRAME_MASK = (1 << 4)
+
 def read_c_string(context, ptr):
+    """! @brief Reads a null-terminated C string from the target."""
     if ptr == 0:
         return ""
 
@@ -55,12 +55,13 @@ def read_c_string(context, ptr):
                     s += chr(c)
                     badCount = 0
     except exceptions.TransferError:
-        logging.debug("TransferError while trying to read 16 bytes at 0x%08x", ptr)
+        LOG.debug("TransferError while trying to read 16 bytes at 0x%08x", ptr)
 
     return s
 
-## @brief Class representing the handler mode.
 class HandlerModeThread(TargetThread):
+    """! @brief Class representing the handler mode."""
+
     UNIQUE_ID = 2
     
     def __init__(self, targetContext, provider):

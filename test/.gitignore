@@ -1,10 +1,12 @@
-output*.txt
-gdb_test_raw*.txt
-test_params*.txt
-test_results*.txt
-automated_test_results*.txt
-automated_test_summary.txt
-test_results.xml
-test_boards.yaml
+# Test output files
+output
+*.txt
+*.xml
+
+# pyocd config for test
+pyocd.yaml
+
+# gdb history
+.gdb_history
 
 

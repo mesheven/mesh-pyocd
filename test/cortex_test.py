@@ -1,23 +1,24 @@
-"""
- mbed CMSIS-DAP debugger
- Copyright (c) 2006-2015 ARM Limited
-
- Licensed under the Apache License, Version 2.0 (the "License");
- you may not use this file except in compliance with the License.
- You may obtain a copy of the License at
-
-     http://www.apache.org/licenses/LICENSE-2.0
-
- Unless required by applicable law or agreed to in writing, software
- distributed under the License is distributed on an "AS IS" BASIS,
- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- See the License for the specific language governing permissions and
- limitations under the License.
-"""
+# pyOCD debugger
+# Copyright (c) 2015-2019 Arm Limited
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from __future__ import print_function
 
-import argparse, os, sys
-from time import sleep, time
+import argparse
+import os
+import sys
+from time import (sleep, time)
 from random import randrange
 import math
 import argparse
@@ -25,32 +26,57 @@ import traceback
 import logging
 from random import randrange
 
-parentdir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, parentdir)
-
 from pyocd.core.target import Target
+from pyocd.coresight.cortex_m import CortexM
 from pyocd.gdbserver.context_facade import GDBDebugContextFacade
 from pyocd.core.helpers import ConnectHelper
 from pyocd.utility.conversion import float32_to_u32, u32_to_float32
 from pyocd.utility.mask import same
 from pyocd.core import exceptions
 from pyocd.core.memory_map import MemoryType
-from pyocd.flash.loader import FileProgrammer
-from test_util import (Test, TestResult, get_session_options)
+from pyocd.flash.file_programmer import FileProgrammer
+
+from test_util import (
+    Test,
+    TestResult,
+    get_session_options,
+    get_target_test_params,
+    get_test_binary_path,
+    )
 
 TEST_COUNT = 20
 
 class CortexTestResult(TestResult):
+    METRICS = [
+        "get_t_response",
+        "step",
+        "bp_add_remove",
+        "get_reg_context",
+        "set_reg_context",
+        "run_halt",
+        "gdb_step",
+        ]
+    
     def __init__(self):
         super(CortexTestResult, self).__init__(None, None, None)
         self.name = "cortex"
+        self.times = {}
+        for metric in self.METRICS:
+            self.times[metric] = -1.0
 
 class CortexTest(Test):
     def __init__(self):
         super(CortexTest, self).__init__("Cortex Test", cortex_test)
 
     def print_perf_info(self, result_list, output_file=None):
-        pass
+        result_list = filter(lambda x: isinstance(x, CortexTestResult), result_list)
+        print("\n\n------ Cortex Test Performance ------", file=output_file)
+        print("", file=output_file)
+        for result in result_list:
+            print("Target {}:".format(result.board), file=output_file)
+            for metric in CortexTestResult.METRICS:
+                print("    {:<20} = {: 8.3f} ms".format(metric, result.times[metric] * 1000), file=output_file)
+        print("", file=output_file)
 
     def run(self, board):
         try:
@@ -77,25 +103,19 @@ def test_function(session, function):
     return (stop - start) / float(TEST_COUNT)
 
 def cortex_test(board_id):
-    with ConnectHelper.session_with_chosen_probe(board_id=board_id, **get_session_options()) as session:
+    with ConnectHelper.session_with_chosen_probe(unique_id=board_id, **get_session_options()) as session:
         board = session.board
         target_type = board.target_type
 
-        binary_file = os.path.join(parentdir, 'binaries', board.test_binary)
+        binary_file = get_test_binary_path(board.test_binary)
 
-        test_clock = 10000000
+        test_params = get_target_test_params(session)
+        test_clock = test_params['test_clock']
         addr_invalid = 0x3E000000 # Last 16MB of ARM SRAM region - typically empty
-        expect_invalid_access_to_fail = True
-        if target_type in ("nrf51", "nrf52", "nrf52840"):
-            # Override clock since 10MHz is too fast
-            test_clock = 1000000
-            expect_invalid_access_to_fail = False
-        elif target_type == "ncs36510":
-            # Override clock since 10MHz is too fast
-            test_clock = 1000000
+        expect_invalid_access_to_fail = test_params['error_on_invalid_access']
 
         memory_map = board.target.get_memory_map()
-        ram_region = memory_map.get_first_region_of_type(MemoryType.RAM)
+        ram_region = memory_map.get_default_region_of_type(MemoryType.RAM)
         rom_region = memory_map.get_boot_memory()
 
         addr = ram_region.start
@@ -127,36 +147,42 @@ def cortex_test(board_id):
 
         print("\n\n----- TESTING CORTEX-M PERFORMANCE -----")
         test_time = test_function(session, gdbFacade.get_t_response)
-        print("Function get_t_response time: %f" % test_time)
+        result.times["get_t_response"] = test_time
+        print("Function get_t_response time:    %f" % test_time)
 
         # Step
         test_time = test_function(session, target.step)
-        print("Function step time: %f" % test_time)
+        result.times["step"] = test_time
+        print("Function step time:              %f" % test_time)
 
         # Breakpoint
         def set_remove_breakpoint():
             target.set_breakpoint(0)
             target.remove_breakpoint(0)
         test_time = test_function(session, set_remove_breakpoint)
-        print("Add and remove breakpoint: %f" % test_time)
+        result.times["bp_add_remove"] = test_time
+        print("Add and remove breakpoint:       %f" % test_time)
 
         # get_register_context
         test_time = test_function(session, gdbFacade.get_register_context)
-        print("Function get_register_context: %f" % test_time)
+        result.times["get_reg_context"] = test_time
+        print("Function get_register_context:   %f" % test_time)
 
         # set_register_context
         context = gdbFacade.get_register_context()
         def set_register_context():
             gdbFacade.set_register_context(context)
         test_time = test_function(session, set_register_context)
-        print("Function set_register_context: %f" % test_time)
+        result.times["set_reg_context"] = test_time
+        print("Function set_register_context:   %f" % test_time)
 
         # Run / Halt
         def run_halt():
             target.resume()
             target.halt()
         test_time = test_function(session, run_halt)
-        print("Resume and halt: %f" % test_time)
+        result.times["run_halt"] = test_time
+        print("Resume and halt:                 %f" % test_time)
 
         # GDB stepping
         def simulate_step():
@@ -168,7 +194,72 @@ def cortex_test(board_id):
             gdbFacade.get_t_response()
             target.remove_breakpoint(0)
         test_time = test_function(session, simulate_step)
-        print("Simulated GDB step: %f" % test_time)
+        result.times["gdb_step"] = test_time
+        print("Simulated GDB step:              %f" % test_time)
+
+        # Test passes if there are no exceptions
+        test_pass_count += 1
+        test_count += 1
+        print("TEST PASSED")
+
+        print("\n\n------ Testing Reset Types ------")
+        def reset_methods(fnc):
+            print("Hardware reset")
+            fnc(reset_type=Target.ResetType.HW)
+            print("Hardware reset (default=HW)")
+            target.selected_core.default_reset_type = Target.ResetType.HW
+            fnc(reset_type=None)
+            print("Software reset (default=SYSRESETREQ)")
+            target.selected_core.default_reset_type = Target.ResetType.SW_SYSRESETREQ
+            fnc(reset_type=None)
+            print("Software reset (default=VECTRESET)")
+            target.selected_core.default_reset_type = Target.ResetType.SW_VECTRESET
+            fnc(reset_type=None)
+            print("Software reset (default=emulated)")
+            target.selected_core.default_reset_type = Target.ResetType.SW_EMULATED
+            fnc(reset_type=None)
+            
+            print("(Default) Software reset (SYSRESETREQ)")
+            target.selected_core.default_software_reset_type = Target.ResetType.SW_SYSRESETREQ
+            fnc(reset_type=Target.ResetType.SW)
+            print("(Default) Software reset (VECTRESET)")
+            target.selected_core.default_software_reset_type = Target.ResetType.SW_VECTRESET
+            fnc(reset_type=Target.ResetType.SW)
+            print("(Default) Software reset (emulated)")
+            target.selected_core.default_software_reset_type = Target.ResetType.SW_EMULATED
+            fnc(reset_type=Target.ResetType.SW)
+            
+            print("Software reset (option=default)")
+            target.selected_core.default_reset_type = Target.ResetType.SW
+            target.selected_core.default_software_reset_type = Target.ResetType.SW_SYSRESETREQ
+            session.options['reset_type'] = 'default'
+            fnc(reset_type=None)
+            print("Software reset (option=hw)")
+            session.options['reset_type'] = 'hw'
+            fnc(reset_type=None)
+            print("Software reset (option=sw)")
+            session.options['reset_type'] = 'sw'
+            fnc(reset_type=None)
+            print("Software reset (option=sw_sysresetreq)")
+            session.options['reset_type'] = 'sw_sysresetreq'
+            fnc(reset_type=None)
+            print("Software reset (option=sw_vectreset)")
+            session.options['reset_type'] = 'sw_vectreset'
+            fnc(reset_type=None)
+            print("Software reset (option=sw_emulated)")
+            session.options['reset_type'] = 'sw_emulated'
+            fnc(reset_type=None)
+
+        reset_methods(target.reset)
+        
+        # Test passes if there are no exceptions
+        test_pass_count += 1
+        test_count += 1
+        print("TEST PASSED")
+
+
+        print("\n\n------ Testing Reset Halt ------")
+        reset_methods(target.reset_and_halt)
 
         # Test passes if there are no exceptions
         test_pass_count += 1
@@ -225,6 +316,38 @@ def cortex_test(board_id):
         # Restore regs
         origRegs[0] = origR0
         target.write_core_registers_raw(['r0', 'r1', 'r2', 'r3'], origRegs)
+        
+        print("Verify exception is raised while core is running")
+        target.resume()
+        try:
+            val = target.read_core_register('r0')
+        except exceptions.CoreRegisterAccessError:
+            passed = True
+        else:
+            passed = False
+        test_count += 1
+        if passed:
+            test_pass_count += 1
+            print("TEST PASSED")
+        else:
+            print("TEST FAILED")
+        
+        print("Verify failure to write core register while running raises exception")
+        try:
+            target.write_core_register('r0', 0x1234)
+        except exceptions.CoreRegisterAccessError:
+            passed = True
+        else:
+            passed = False
+        test_count += 1
+        if passed:
+            test_pass_count += 1
+            print("TEST PASSED")
+        else:
+            print("TEST FAILED")
+        
+        # Resume execution.
+        target.halt()
 
         if target.selected_core.has_fpu:
             print("Reading s0")
@@ -286,6 +409,23 @@ def cortex_test(board_id):
             origRegs[0] = origRawS0
             target.write_core_registers_raw(['s0', 's1'], origRegs)
         
+        print("Verify that all listed core registers can be accessed")
+        reg_count = 0
+        passed_reg_count = 0
+        for r in target.selected_core.core_registers.as_set:
+            try:
+                reg_count += 1
+                val = target.read_core_register(r.name)
+                target.write_core_register(r.name, val)
+                passed_reg_count += 1
+            except exceptions.CoreRegisterAccessError:
+                pass
+        test_count += 1
+        if passed_reg_count == reg_count:
+            test_pass_count += 1
+            print("TEST PASSED (%i registers)" % reg_count)
+        else:
+            print("TEST FAILED (%i registers, %i failed)" % (reg_count, reg_count - passed_reg_count))
 
         print("\n\n------ Testing Invalid Memory Access Recovery ------")
         memory_access_pass = True
@@ -424,7 +564,7 @@ def cortex_test(board_id):
             return test_passed
 
         print("Installed software breakpoint at 0x%08x" % addr)
-        target.set_breakpoint(addr, Target.BREAKPOINT_SW)
+        target.set_breakpoint(addr, Target.BreakpointType.SW)
         test_passed = test_filters() and test_passed
 
         print("Removed software breakpoint")
@@ -437,6 +577,13 @@ def cortex_test(board_id):
             print("TEST PASSED")
         else:
             print("TEST FAILED")
+
+        print("\nTest Summary:")
+        print("Pass count %i of %i tests" % (test_pass_count, test_count))
+        if test_pass_count == test_count:
+            print("CORTEX TEST PASSED")
+        else:
+            print("CORTEX TEST FAILED")
 
         target.reset()
 

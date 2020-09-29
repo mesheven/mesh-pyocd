@@ -1,35 +1,54 @@
-"""
- mbed CMSIS-DAP debugger
- Copyright (c) 2006-2015,2018 ARM Limited
-
- Licensed under the Apache License, Version 2.0 (the "License");
- you may not use this file except in compliance with the License.
- You may obtain a copy of the License at
-
-     http://www.apache.org/licenses/LICENSE-2.0
-
- Unless required by applicable law or agreed to in writing, software
- distributed under the License is distributed on an "AS IS" BASIS,
- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- See the License for the specific language governing permissions and
- limitations under the License.
-"""
+# pyOCD debugger
+# Copyright (c) 2006-2020 Arm Limited
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from __future__ import print_function
 
-import argparse, os, sys
+import argparse
+import os
+import sys
 from time import sleep
 from random import randrange
 import math
 import logging
 
-parentdir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, parentdir)
-
 from pyocd.core.helpers import ConnectHelper
 from pyocd.core.memory_map import MemoryType
-from pyocd.flash.loader import FileProgrammer
-from pyocd.utility.conversion import float32_to_u32
-from test_util import (Test, get_session_options)
+from pyocd.flash.file_programmer import FileProgrammer
+from pyocd.utility.conversion import (float32_to_u32, u16le_list_to_byte_list)
+from pyocd.utility.mask import same
+
+from test_util import (
+    Test,
+    get_session_options,
+    get_test_binary_path,
+    )
+
+# Simple code sequence used to test range stepping.
+# The important part is that it has no branches.
+RANGE_STEP_CODE = u16le_list_to_byte_list([
+        0x3001, # adds    r0, #1
+        0x43C1, # mvns    r1, r0
+        0x3101, # adds    r1, #1
+        0x0102, # movs    r2, r0, lsl #4
+        0x0013, # movs    r3, r2
+        0x404B, # eors    r3, r1
+        0x1840, # adds    r0, r1
+        0x1880, # adds    r0, r2
+        0x1AC0, # subs    r0, r3
+        0xBE00, # bkpt    #0
+        ])
 
 class BasicTest(Test):
     def __init__(self):
@@ -47,20 +66,19 @@ def basic_test(board_id, file):
         binary_file = "l1_"
 
         if file is None:
-            binary_file = os.path.join(parentdir, 'binaries', board.test_binary)
+            binary_file = get_test_binary_path(board.test_binary)
         else:
             binary_file = file
 
         print("binary file: %s" % binary_file)
 
         memory_map = board.target.get_memory_map()
-        ram_region = memory_map.get_first_region_of_type(MemoryType.RAM)
+        ram_region = memory_map.get_default_region_of_type(MemoryType.RAM)
         rom_region = memory_map.get_boot_memory()
 
         addr = ram_region.start
         size = 0x502
         addr_bin = rom_region.start
-        addr_flash = rom_region.start + rom_region.length // 2
 
         target = board.target
         flash = rom_region.flash
@@ -82,11 +100,16 @@ def basic_test(board_id, file):
         psp = target.read_core_register('psp')
         print("MSP = 0x%08x; PSP = 0x%08x" % (msp, psp))
 
-        control = target.read_core_register('control')
-        faultmask = target.read_core_register('faultmask')
-        basepri = target.read_core_register('basepri')
-        primask = target.read_core_register('primask')
-        print("CONTROL = 0x%02x; FAULTMASK = 0x%02x; BASEPRI = 0x%02x; PRIMASK = 0x%02x" % (control, faultmask, basepri, primask))
+        if 'faultmask' in target.core_registers.by_name:
+            control = target.read_core_register('control')
+            faultmask = target.read_core_register('faultmask')
+            basepri = target.read_core_register('basepri')
+            primask = target.read_core_register('primask')
+            print("CONTROL = 0x%02x; FAULTMASK = 0x%02x; BASEPRI = 0x%02x; PRIMASK = 0x%02x" % (control, faultmask, basepri, primask))
+        else:
+            control = target.read_core_register('control')
+            primask = target.read_core_register('primask')
+            print("CONTROL = 0x%02x; PRIMASK = 0x%02x" % (control, primask))
 
         target.write_core_register('primask', 1)
         newPrimask = target.read_core_register('primask')
@@ -95,7 +118,7 @@ def basic_test(board_id, file):
         newPrimask = target.read_core_register('primask')
         print("Restored PRIMASK = 0x%02x" % newPrimask)
 
-        if target.has_fpu:
+        if target.selected_core.has_fpu:
             s0 = target.read_core_register('s0')
             print("S0 = %g (0x%08x)" % (s0, float32_to_u32(s0)))
             target.write_core_register('s0', math.pi)
@@ -121,7 +144,7 @@ def basic_test(board_id, file):
         print("\n\n------ TEST STEP ------")
 
         print("reset and halt")
-        target.reset_stop_on_reset()
+        target.reset_and_halt()
         currentPC = target.read_core_register('pc')
         print("HALT: pc: 0x%X" % currentPC)
         sleep(0.2)
@@ -131,9 +154,40 @@ def basic_test(board_id, file):
             target.step()
             newPC = target.read_core_register('pc')
             print("STEP: pc: 0x%X" % newPC)
-            currentPC = newPC
             sleep(0.2)
 
+        print("\n\n------ TEST RANGE STEP ------")
+
+        # Add some extra room before end of memory, and a second copy so there are instructions
+        # after the final bkpt. Add 1 because region end is always odd.
+        test_addr = ram_region.end + 1 - len(RANGE_STEP_CODE) * 2 - 32
+        # Since the end address is inclusive, we need to exclude the last instruction.
+        test_end_addr = test_addr + len(RANGE_STEP_CODE) - 2
+        print("range start = %#010x; range_end = %#010x" % (test_addr, test_end_addr))
+        # Load up some code into ram to test range step.
+        target.write_memory_block8(test_addr, RANGE_STEP_CODE * 2)
+        check_data = target.read_memory_block8(test_addr, len(RANGE_STEP_CODE) * 2)
+        if not same(check_data, RANGE_STEP_CODE * 2):
+            print("Failed to write range step test code to RAM")
+        else:
+            print("wrote range test step code to RAM successfully")
+        
+        target.write_core_register('pc', test_addr)
+        currentPC = target.read_core_register('pc')
+        print("start PC: 0x%X" % currentPC)
+        target.step(start=test_addr, end=test_end_addr)
+        newPC = target.read_core_register('pc')
+        print("end PC: 0x%X" % newPC)
+
+        # Now test again to ensure the bkpt stops it.
+        target.write_core_register('pc', test_addr)
+        currentPC = target.read_core_register('pc')
+        print("start PC: 0x%X" % currentPC)
+        target.step(start=test_addr, end=test_end_addr + 4) # include bkpt
+        newPC = target.read_core_register('pc')
+        print("end PC: 0x%X" % newPC)
+        halt_reason = target.get_halt_reason()
+        print("halt reason: %s (should be BREAKPOINT)" % halt_reason.name)
 
         print("\n\n------ TEST READ / WRITE MEMORY ------")
         target.halt()
@@ -191,31 +245,62 @@ def basic_test(board_id, file):
 
         print("\n\n------ TEST PROGRAM/ERASE PAGE ------")
         # Fill 3 pages with 0x55
-        page_size = flash.get_page_info(addr_flash).size
+        sector_size = rom_region.sector_size
+        page_size = rom_region.page_size
+        sectors_to_test = min(rom_region.length // sector_size, 3)
+        addr_flash = rom_region.start + rom_region.length - sector_size * sectors_to_test
         fill = [0x55] * page_size
-        for i in range(0, 3):
-            address = addr_flash + page_size * i
+        for i in range(0, sectors_to_test):
+            address = addr_flash + sector_size * i
             # Test only supports a location with 3 aligned
             # pages of the same size
             current_page_size = flash.get_page_info(addr_flash).size
             assert page_size == current_page_size
             assert address % current_page_size == 0
 
+            print("Erasing sector @ 0x%x (%d bytes)" % (address, sector_size))
             flash.init(flash.Operation.ERASE)
-            flash.erase_page(address)
-            flash.uninit()
+            flash.erase_sector(address)
 
-            flash.init(flash.Operation.PROGRAM)
-            flash.program_page(address, fill)
-            flash.uninit()
-        # Erase the middle page
-        flash.init(flash.Operation.ERASE)
-        flash.erase_page(addr_flash + page_size)
+            print("Verifying erased sector @ 0x%x (%d bytes)" % (address, sector_size))
+            data = target.read_memory_block8(address, sector_size)
+            if data != [flash.region.erased_byte_value] * sector_size:
+                print("FAILED to erase sector @ 0x%x (%d bytes)" % (address, sector_size))
+            else:
+                print("Programming page @ 0x%x (%d bytes)" % (address, page_size))
+                flash.init(flash.Operation.PROGRAM)
+                flash.program_page(address, fill)
+
+                print("Verifying programmed page @ 0x%x (%d bytes)" % (address, page_size))
+                data = target.read_memory_block8(address, page_size)
+                if data != fill:
+                    print("FAILED to program page @ 0x%x (%d bytes)" % (address, page_size))
+
+        # Erase the middle sector
+        if sectors_to_test > 1:
+            address = addr_flash + sector_size
+            print("Erasing sector @ 0x%x (%d bytes)" % (address, sector_size))
+            flash.init(flash.Operation.ERASE)
+            flash.erase_sector(address)
         flash.cleanup()
-        # Verify the 1st and 3rd page were not erased, and that the 2nd page is fully erased
-        data = target.read_memory_block8(addr_flash, page_size * 3)
-        expected = fill + [0xFF] * page_size + fill
-        if data == expected:
+
+        print("Verifying erased sector @ 0x%x (%d bytes)" % (address, sector_size))
+        data = target.read_memory_block8(address, sector_size)
+        if data != [flash.region.erased_byte_value] * sector_size:
+            print("FAILED to erase sector @ 0x%x (%d bytes)" % (address, sector_size))
+       
+        # Re-verify the 1st and 3rd page were not erased, and that the 2nd page is fully erased
+        did_pass = False
+        for i in range(0, sectors_to_test):
+            address = addr_flash + sector_size * i
+            print("Verifying page @ 0x%x (%d bytes)" % (address, page_size))
+            data = target.read_memory_block8(address, page_size)
+            expected = ([flash.region.erased_byte_value] * page_size) if (i == 1) else fill
+            did_pass = (data == expected)
+            if not did_pass:
+                print("FAILED verify for page @ 0x%x (%d bytes)" % (address, page_size))
+                break
+        if did_pass:
             print("TEST PASSED")
         else:
             print("TEST FAILED")

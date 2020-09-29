@@ -1,5 +1,5 @@
 # pyOCD debugger
-# Copyright (c) 2018 Arm Limited
+# Copyright (c) 2018-2020 Arm Limited
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,15 +14,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import six
+from time import sleep
+
 from .debug_probe import DebugProbe
 from ..core import exceptions
+from ..core.plugin import Plugin
 from .pydapaccess import DAPAccess
 from ..board.mbed_board import MbedBoard
 from ..board.board_ids import BOARD_ID_TO_INFO
-import six
 
-## @brief Wraps a pydapaccess link as a DebugProbe.
 class CMSISDAPProbe(DebugProbe):
+    """! @brief Wraps a pydapaccess link as a DebugProbe.
+    
+    Supports CMSIS-DAP v1 and v2.
+    """
 
     # Masks for CMSIS-DAP capabilities.
     SWD_CAPABILITY_MASK = 1
@@ -44,12 +50,6 @@ class CMSISDAPProbe(DebugProbe):
     
     # Bitmasks for AP register address fields.
     A32 = 0x0000000c
-    APBANKSEL = 0x000000f0
-    APSEL = 0xff000000
-    APSEL_APBANKSEL = APSEL | APBANKSEL
-    
-    # Address of DP's SELECT register.
-    DP_SELECT = 0x8
     
     # Map from AP/DP and 2-bit register address to the enums used by pydapaccess.
     REG_ADDR_TO_ID_MAP = {
@@ -64,27 +64,35 @@ class CMSISDAPProbe(DebugProbe):
         ( 1,    0xC ) : DAPAccess.REG.AP_0xC,
         }
     
+    ## USB VID and PID pair for DAPLink firmware.
+    DAPLINK_VIDPID = (0x0d28, 0x0204)
+    
     @classmethod
-    def get_all_connected_probes(cls):
+    def get_all_connected_probes(cls, unique_id=None, is_explicit=False):
         try:
             return [cls(dev) for dev in DAPAccess.get_connected_devices()]
         except DAPAccess.Error as exc:
             six.raise_from(cls._convert_exception(exc), exc)
     
     @classmethod
-    def get_probe_with_id(cls, unique_id):
+    def get_probe_with_id(cls, unique_id, is_explicit=False):
         try:
-            return cls(DAPAccess(unique_id))
+            dap_access = DAPAccess.get_device(unique_id)
+            if dap_access is not None:
+                return cls(dap_access)
+            else:
+                return None
         except DAPAccess.Error as exc:
             six.raise_from(cls._convert_exception(exc), exc)
 
     def __init__(self, device):
+        super(CMSISDAPProbe, self).__init__()
         self._link = device
         self._supported_protocols = None
         self._protocol = None
         self._is_open = False
-        self._dp_select = -1
-        
+        self._caps = set()
+    
     @property
     def description(self):
         try:
@@ -103,9 +111,9 @@ class CMSISDAPProbe(DebugProbe):
     def product_name(self):
         return self._link.product_name
 
-    ## @brief Only valid after opening.
     @property
     def supported_wire_protocols(self):
+        """! @brief Only valid after opening."""
         return self._supported_protocols
 
     @property
@@ -119,15 +127,27 @@ class CMSISDAPProbe(DebugProbe):
     @property
     def is_open(self):
         return self._is_open
+    
+    @property
+    def capabilities(self):
+        return self._caps
 
-    def create_associated_board(self, session):
-        return MbedBoard(session)
+    def create_associated_board(self):
+        assert self.session is not None
+        
+        # Only support associated Mbed boards for DAPLink firmware. We can't assume other
+        # CMSIS-DAP firmware is using the same serial number format, so we cannot reliably
+        # extract the board ID.
+        if self._link.vidpid == self.DAPLINK_VIDPID:
+            return MbedBoard(self.session, board_id=self.unique_id[0:4])
+        else:
+            return None
     
     def open(self):
         try:
             self._link.open()
             self._is_open = True
-            self._link.set_deferred_transfer(True)
+            self._link.set_deferred_transfer(self.session.options.get('cmsis_dap.deferred_transfers'))
         
             # Read CMSIS-DAP capabilities
             self._capabilities = self._link.identify(DAPAccess.ID.CAPABILITIES)
@@ -136,6 +156,14 @@ class CMSISDAPProbe(DebugProbe):
                 self._supported_protocols.append(DebugProbe.Protocol.SWD)
             if self._capabilities & self.JTAG_CAPABILITY_MASK:
                 self._supported_protocols.append(DebugProbe.Protocol.JTAG)
+            
+            self._caps = {
+                self.Capability.SWJ_SEQUENCE,
+                self.Capability.BANKED_DP_REGISTERS,
+                self.Capability.APv2_ADDRESSES,
+                }
+            if self._link.has_swo():
+                self._caps.add(self.Capability.SWO)
         except DAPAccess.Error as exc:
             six.raise_from(self._convert_exception(exc), exc)
     
@@ -150,7 +178,6 @@ class CMSISDAPProbe(DebugProbe):
     #          Target control functions
     # ------------------------------------------- #
     def connect(self, protocol=None):
-        """Initialize DAP IO pins for JTAG or SWD"""
         # Convert protocol to port enum.
         if protocol is not None:
             port = self.PORT_MAP[protocol]
@@ -165,61 +192,48 @@ class CMSISDAPProbe(DebugProbe):
         # Read the current mode and save it.
         actualMode = self._link.get_swj_mode()
         self._protocol = self.PORT_MAP[actualMode]
-        
-        self._invalidate_cached_registers()
 
-    # TODO remove
-    def swj_sequence(self):
-        """Send sequence to activate JTAG or SWD on the target"""
+    def swj_sequence(self, length, bits):
         try:
-            self._link.swj_sequence()
+            self._link.swj_sequence(length, bits)
         except DAPAccess.Error as exc:
             six.raise_from(self._convert_exception(exc), exc)
 
     def disconnect(self):
-        """Deinitialize the DAP I/O pins"""
         try:
             self._link.disconnect()
             self._protocol = None
-            self._invalidate_cached_registers()
         except DAPAccess.Error as exc:
             six.raise_from(self._convert_exception(exc), exc)
 
     def set_clock(self, frequency):
-        """Set the frequency for JTAG and SWD in Hz
-
-        This function is safe to call before connect is called.
-        """
         try:
             self._link.set_clock(frequency)
         except DAPAccess.Error as exc:
             six.raise_from(self._convert_exception(exc), exc)
 
     def reset(self):
-        """Reset the target"""
         try:
-            self._invalidate_cached_registers()
-            self._link.reset()
+            self._link.assert_reset(True)
+            sleep(self.session.options.get('reset.hold_time'))
+            self._link.assert_reset(False)
+            sleep(self.session.options.get('reset.post_delay'))
         except DAPAccess.Error as exc:
             six.raise_from(self._convert_exception(exc), exc)
 
     def assert_reset(self, asserted):
-        """Assert or de-assert target reset line"""
         try:
-            self._invalidate_cached_registers()
             self._link.assert_reset(asserted)
         except DAPAccess.Error as exc:
             six.raise_from(self._convert_exception(exc), exc)
     
     def is_reset_asserted(self):
-        """Returns True if the target reset line is asserted or False if de-asserted"""
         try:
             return self._link.is_reset_asserted()
         except DAPAccess.Error as exc:
             six.raise_from(self._convert_exception(exc), exc)
 
     def flush(self):
-        """Write out all unsent commands"""
         try:
             self._link.flush()
         except DAPAccess.Error as exc:
@@ -229,20 +243,12 @@ class CMSISDAPProbe(DebugProbe):
     #          DAP Access functions
     # ------------------------------------------- #
 
-    ## @brief Read a DP register.
-    #
-    # @param self
-    # @param addr Integer register address being one of (0x0, 0x4, 0x8, 0xC).
-    # @param now
-    #
-    # @todo Handle auto DPBANKSEL.
     def read_dp(self, addr, now=True):
         reg_id = self.REG_ADDR_TO_ID_MAP[self.DP, addr]
         
         try:
             result = self._link.read_reg(reg_id, now=now)
         except DAPAccess.Error as error:
-            self._invalidate_cached_registers()
             six.raise_from(self._convert_exception(error), error)
 
         # Read callback returned for async reads.
@@ -250,7 +256,6 @@ class CMSISDAPProbe(DebugProbe):
             try:
                 return result()
             except DAPAccess.Error as error:
-                self._invalidate_cached_registers()
                 six.raise_from(self._convert_exception(error), error)
 
         return result if now else read_dp_result_callback
@@ -258,17 +263,10 @@ class CMSISDAPProbe(DebugProbe):
     def write_dp(self, addr, data):
         reg_id = self.REG_ADDR_TO_ID_MAP[self.DP, addr]
         
-        # Skip writing DP SELECT register if its value is not changing.
-        if addr == self.DP_SELECT:
-            if data == self._dp_select:
-                return
-            self._dp_select = data
-
         # Write the DP register.
         try:
             self._link.write_reg(reg_id, data)
         except DAPAccess.Error as error:
-            self._invalidate_cached_registers()
             six.raise_from(self._convert_exception(error), error)
 
         return True
@@ -278,10 +276,8 @@ class CMSISDAPProbe(DebugProbe):
         ap_reg = self.REG_ADDR_TO_ID_MAP[self.AP, (addr & self.A32)]
 
         try:
-            self.write_dp(self.DP_SELECT, addr & self.APSEL_APBANKSEL)
             result = self._link.read_reg(ap_reg, now=now)
         except DAPAccess.Error as error:
-            self._invalidate_cached_registers()
             six.raise_from(self._convert_exception(error), error)
 
         # Read callback returned for async reads.
@@ -289,7 +285,6 @@ class CMSISDAPProbe(DebugProbe):
             try:
                 return result()
             except DAPAccess.Error as error:
-                self._invalidate_cached_registers()
                 six.raise_from(self._convert_exception(error), error)
 
         return result if now else read_ap_result_callback
@@ -298,14 +293,10 @@ class CMSISDAPProbe(DebugProbe):
         assert type(addr) in (six.integer_types)
         ap_reg = self.REG_ADDR_TO_ID_MAP[self.AP, (addr & self.A32)]
 
-        # Select the AP and bank.
-        self.write_dp(self.DP_SELECT, addr & self.APSEL_APBANKSEL)
-
-        # Perform the AP register write.
         try:
+            # Perform the AP register write.
             self._link.write_reg(ap_reg, data)
         except DAPAccess.Error as error:
-            self._invalidate_cached_registers()
             six.raise_from(self._convert_exception(error), error)
 
         return True
@@ -315,12 +306,8 @@ class CMSISDAPProbe(DebugProbe):
         ap_reg = self.REG_ADDR_TO_ID_MAP[self.AP, (addr & self.A32)]
         
         try:
-            # Select the AP and bank.
-            self.write_dp(self.DP_SELECT, addr & self.APSEL_APBANKSEL)
-            
             result = self._link.reg_read_repeat(count, ap_reg, dap_index=0, now=now)
         except DAPAccess.Error as exc:
-            self._invalidate_cached_registers()
             six.raise_from(self._convert_exception(exc), exc)
 
         # Need to wrap the deferred callback to convert exceptions.
@@ -328,7 +315,6 @@ class CMSISDAPProbe(DebugProbe):
             try:
                 return result()
             except DAPAccess.Error as exc:
-                self._invalidate_cached_registers()
                 six.raise_from(self._convert_exception(exc), exc)
 
         return result if now else read_ap_repeat_callback
@@ -338,17 +324,32 @@ class CMSISDAPProbe(DebugProbe):
         ap_reg = self.REG_ADDR_TO_ID_MAP[self.AP, (addr & self.A32)]
         
         try:
-            # Select the AP and bank.
-            self.write_dp(self.DP_SELECT, addr & self.APSEL_APBANKSEL)
-            
             return self._link.reg_write_repeat(len(values), ap_reg, values, dap_index=0)
         except DAPAccess.Error as exc:
-            self._invalidate_cached_registers()
+            six.raise_from(self._convert_exception(exc), exc)
+    
+    # ------------------------------------------- #
+    #          SWO functions
+    # ------------------------------------------- #
+
+    def swo_start(self, baudrate):
+        try:
+            self._link.swo_configure(True, baudrate)
+            self._link.swo_control(True)
+        except DAPAccess.Error as exc:
             six.raise_from(self._convert_exception(exc), exc)
 
-    def _invalidate_cached_registers(self):
-        # Invalidate cached DP SELECT register.
-        self._dp_select = -1
+    def swo_stop(self):
+        try:
+            self._link.swo_configure(False, 0)
+        except DAPAccess.Error as exc:
+            six.raise_from(self._convert_exception(exc), exc)
+
+    def swo_read(self):
+        try:
+            return self._link.swo_read()
+        except DAPAccess.Error as exc:
+            six.raise_from(self._convert_exception(exc), exc)
 
     def get_unique_id(self):
         return self._link.get_unique_id()
@@ -384,15 +385,28 @@ class CMSISDAPProbe(DebugProbe):
     @staticmethod
     def _convert_exception(exc):
         if isinstance(exc, DAPAccess.TransferFaultError):
-            return exceptions.TransferFaultError()
+            return exceptions.TransferFaultError(*exc.args)
         elif isinstance(exc, DAPAccess.TransferTimeoutError):
-            return exceptions.TransferTimeoutError()
+            return exceptions.TransferTimeoutError(*exc.args)
         elif isinstance(exc, DAPAccess.TransferError):
-            return exceptions.TransferError()
+            return exceptions.TransferError(*exc.args)
         elif isinstance(exc, (DAPAccess.DeviceError, DAPAccess.CommandError)):
-            return exceptions.ProbeError(str(exc))
+            return exceptions.ProbeError(*exc.args)
         elif isinstance(exc, DAPAccess.Error):
-            return exceptions.PyOCDError(str(exc))
+            return exceptions.Error(*exc.args)
         else:
             return exc
 
+class CMSISDAPProbePlugin(Plugin):
+    """! @brief Plugin class for CMSISDAPProbe."""
+    
+    def load(self):
+        return CMSISDAPProbe
+    
+    @property
+    def name(self):
+        return "cmsisdap"
+    
+    @property
+    def description(self):
+        return "CMSIS-DAP debug probe"

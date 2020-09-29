@@ -1,5 +1,5 @@
 # pyOCD debugger
-# Copyright (c) 2018 Arm Limited
+# Copyright (c) 2018-2020 Arm Limited
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,47 +14,69 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import six
+from time import sleep
+
 from .debug_probe import DebugProbe
 from ..core.memory_interface import MemoryInterface
 from ..core import exceptions
-from .stlink import (STLinkException, usb, stlink)
+from ..core.plugin import Plugin
+from ..coresight.ap import (APVersion, APSEL, APSEL_SHIFT)
+from .stlink.usb import STLinkUSBInterface
+from .stlink.stlink import STLink
+from .stlink.detect.factory import create_mbed_detector
+from ..board.mbed_board import MbedBoard
+from ..board.board_ids import BOARD_ID_TO_INFO
 from ..utility import conversion
-import six
 
-## @brief Wraps an STLink as a DebugProbe.
 class StlinkProbe(DebugProbe):
+    """! @brief Wraps an STLink as a DebugProbe."""
         
-    APSEL = 0xff000000
-    APSEL_SHIFT = 24
+    @classmethod
+    def get_all_connected_probes(cls, unique_id=None, is_explicit=False):
+        return [cls(dev) for dev in STLinkUSBInterface.get_all_connected_devices()]
     
     @classmethod
-    def get_all_connected_probes(cls):
-        try:
-            return [cls(dev) for dev in usb.STLinkUSBInterface.get_all_connected_devices()]
-        except STLinkException as exc:
-            six.raise_from(cls._convert_exception(exc), exc)
-    
-    @classmethod
-    def get_probe_with_id(cls, unique_id):
-        try:
-            for dev in usb.STLinkUSBInterface.get_all_connected_devices():
-                if dev.serial_number == unique_id:
-                    return cls(usb.STLinkUSBInterface(unique_id))
-            else:
-                return None
-        except STLinkException as exc:
-            six.raise_from(cls._convert_exception(exc), exc)
+    def get_probe_with_id(cls, unique_id, is_explicit=False):
+        for dev in STLinkUSBInterface.get_all_connected_devices():
+            if dev.serial_number == unique_id:
+                return cls(dev)
+        else:
+            return None
 
     def __init__(self, device):
-        self._link = stlink.STLink(device)
+        super(StlinkProbe, self).__init__()
+        self._link = STLink(device)
         self._is_open = False
         self._is_connected = False
         self._nreset_state = False
         self._memory_interfaces = {}
+        self._mbed_info = None
+        self._board_id = None
+        self._caps = set()
+        
+        # Try to detect associated board info via the STLinkV2-1 MSD volume.
+        detector = create_mbed_detector()
+        for info in detector.list_mbeds():
+            if info['target_id_usb_id'] == self._link.serial_number:
+                self._mbed_info = info
+                
+                # Some STLink probes provide an MSD volume, but not the mbed.htm file.
+                # We can live without the board ID, so just ignore any error.
+                try:
+                    self._board_id = info['target_id_mbed_htm'][0:4]
+                except KeyError:
+                    pass
+                break
         
     @property
     def description(self):
-        return self.product_name
+        try:
+            board_info = BOARD_ID_TO_INFO[self._board_id]
+        except KeyError:
+            return self.product_name
+        else:
+            return "{0} [{1}]".format(board_info.name, board_info.target)
     
     @property
     def vendor_name(self):
@@ -64,7 +86,6 @@ class StlinkProbe(DebugProbe):
     def product_name(self):
         return self._link.product_name
 
-    ## @brief Only valid after opening.
     @property
     def supported_wire_protocols(self):
         return [DebugProbe.Protocol.DEFAULT, DebugProbe.Protocol.SWD, DebugProbe.Protocol.JTAG]
@@ -81,79 +102,66 @@ class StlinkProbe(DebugProbe):
     def is_open(self):
         return self._is_open
     
+    @property
+    def capabilities(self):
+        return self._caps
+
+    def create_associated_board(self):
+        assert self.session is not None
+        if self._board_id is not None:
+            return MbedBoard(self.session, board_id=self._board_id)
+        else:
+            return None
+    
     def open(self):
-        try:
-            self._link.open()
-            self._is_open = True
-        except STLinkException as exc:
-            six.raise_from(self._convert_exception(exc), exc)
+        self._link.open()
+        self._is_open = True
+        
+        # Update capabilities.
+        self._caps = {
+                self.Capability.SWO,
+                self.Capability.MANAGED_AP_SELECTION,
+                self.Capability.MANAGED_DPBANKSEL,
+                }
+        if self._link.supports_banked_dp:
+            self._caps.add(self.Capability.BANKED_DP_REGISTERS)
     
     def close(self):
-        try:
-            self._link.close()
-            self._is_open = False
-        except STLinkException as exc:
-            six.raise_from(self._convert_exception(exc), exc)
+        self._link.close()
+        self._is_open = False
 
     # ------------------------------------------- #
     #          Target control functions
     # ------------------------------------------- #
     def connect(self, protocol=None):
-        """Initialize DAP IO pins for JTAG or SWD"""
-        try:
-            self._link.enter_debug(stlink.STLink.Protocol.SWD)
-            self._is_connected = True
-        except STLinkException as exc:
-            six.raise_from(self._convert_exception(exc), exc)
-
-    # TODO remove
-    def swj_sequence(self):
-        """Send sequence to activate JTAG or SWD on the target"""
-        pass
+        self._link.enter_debug(STLink.Protocol.SWD)
+        self._is_connected = True
 
     def disconnect(self):
-        """Deinitialize the DAP I/O pins"""
-        try:
-            # TODO Close the APs. When this is attempted, we get an undocumented 0x1d error. Doesn't
-            #      seem to be necessary, anyway.
-            self._memory_interfaces = {}
-            
-            self._link.enter_idle()
-            self._is_connected = False
-        except STLinkException as exc:
-            six.raise_from(self._convert_exception(exc), exc)
+        # TODO Close the APs. When this is attempted, we get an undocumented 0x1d error. Doesn't
+        #      seem to be necessary, anyway.
+        self._memory_interfaces = {}
+        
+        self._link.enter_idle()
+        self._is_connected = False
 
     def set_clock(self, frequency):
-        """Set the frequency for JTAG and SWD in Hz
-
-        This function is safe to call before connect is called.
-        """
-        try:
-            self._link.set_swd_frequency(frequency)
-        except STLinkException as exc:
-            six.raise_from(self._convert_exception(exc), exc)
+        self._link.set_swd_frequency(frequency)
 
     def reset(self):
-        """Reset the target"""
-        try:
-            self._link.target_reset()
-        except STLinkException as exc:
-            six.raise_from(self._convert_exception(exc), exc)
+        self._link.drive_nreset(True)
+        sleep(self.session.options.get('reset.hold_time'))
+        self._link.drive_nreset(False)
+        sleep(self.session.options.get('reset.post_delay'))
 
     def assert_reset(self, asserted):
-        """Assert or de-assert target reset line"""
-        try:
-            self._link.drive_nreset(asserted)
-            self._nreset_state = asserted
-        except STLinkException as exc:
-            six.raise_from(self._convert_exception(exc), exc)
+        self._link.drive_nreset(asserted)
+        self._nreset_state = asserted
     
     def is_reset_asserted(self):
-        """Returns True if the target reset line is asserted or False if de-asserted"""
         return self._nreset_state
 
     def flush(self):
-        """Write out all unsent commands"""
         pass
 
     # ------------------------------------------- #
@@ -161,10 +169,7 @@ class StlinkProbe(DebugProbe):
     # ------------------------------------------- #
     
     def read_dp(self, addr, now=True):
-        try:
-            result = self._link.read_dap_register(stlink.STLink.DP_PORT, addr)
-        except STLinkException as exc:
-            six.raise_from(self._convert_exception(exc), exc)
+        result = self._link.read_dap_register(STLink.DP_PORT, addr)
         
         def read_dp_result_callback():
             return result
@@ -172,17 +177,11 @@ class StlinkProbe(DebugProbe):
         return result if now else read_dp_result_callback
 
     def write_dp(self, addr, data):
-        try:
-            result = self._link.write_dap_register(stlink.STLink.DP_PORT, addr, data)
-        except STLinkException as exc:
-            six.raise_from(self._convert_exception(exc), exc)
+        result = self._link.write_dap_register(STLink.DP_PORT, addr, data)
 
     def read_ap(self, addr, now=True):
-        try:
-            apsel = (addr & self.APSEL) >> self.APSEL_SHIFT
-            result = self._link.read_dap_register(apsel, addr & 0xffff)
-        except STLinkException as exc:
-            six.raise_from(self._convert_exception(exc), exc)
+        apsel = (addr & APSEL) >> APSEL_SHIFT
+        result = self._link.read_dap_register(apsel, addr & 0xffff)
         
         def read_ap_result_callback():
             return result
@@ -190,17 +189,14 @@ class StlinkProbe(DebugProbe):
         return result if now else read_ap_result_callback
 
     def write_ap(self, addr, data):
-        try:
-            apsel = (addr & self.APSEL) >> self.APSEL_SHIFT
-            result = self._link.write_dap_register(apsel, addr & 0xffff, data)
-        except STLinkException as exc:
-            six.raise_from(self._convert_exception(exc), exc)
+        apsel = (addr & APSEL) >> APSEL_SHIFT
+        result = self._link.write_dap_register(apsel, addr & 0xffff, data)
 
     def read_ap_multiple(self, addr, count=1, now=True):
         results = [self.read_ap(addr, now=True) for n in range(count)]
         
         def read_ap_multiple_result_callback():
-            return result
+            return results
         
         return results if now else read_ap_multiple_result_callback
 
@@ -208,31 +204,40 @@ class StlinkProbe(DebugProbe):
         for v in values:
             self.write_ap(addr, v)
 
-    def get_memory_interface_for_ap(self, apsel):
+    def get_memory_interface_for_ap(self, ap_address):
         assert self._is_connected
+        # STLink memory access commands only support an 8-bit APSEL.
+        if ap_address.ap_version != APVersion.APv1:
+            return None
+        apsel = ap_address.apsel
         if apsel not in self._memory_interfaces:
             self._link.open_ap(apsel)
             self._memory_interfaces[apsel] = STLinkMemoryInterface(self._link, apsel)
         return self._memory_interfaces[apsel]
-  
-    @staticmethod
-    def _convert_exception(exc):
-        if isinstance(exc, STLinkException):
-            return exceptions.ProbeError(str(exc))
-        else:
-            return exc
 
-## @brief Concrete memory interface for a single AP.
+    def swo_start(self, baudrate):
+        self._link.swo_start(baudrate)
+
+    def swo_stop(self):
+        self._link.swo_stop()
+
+    def swo_read(self):
+        return self._link.swo_read()
+
 class STLinkMemoryInterface(MemoryInterface):
+    """! @brief Concrete memory interface for a single AP."""
+    
     def __init__(self, link, apsel):
         self._link = link
         self._apsel = apsel
 
-    ## @brief Write a single memory location.
-    #
-    # By default the transfer size is a word.
     def write_memory(self, addr, data, transfer_size=32):
+        """! @brief Write a single memory location.
+        
+        By default the transfer size is a word.
+        """
         assert transfer_size in (8, 16, 32)
+        addr &= 0xffffffff
         if transfer_size == 32:
             self._link.write_mem32(addr, conversion.u32le_list_to_byte_list([data]), self._apsel)
         elif transfer_size == 16:
@@ -240,11 +245,13 @@ class STLinkMemoryInterface(MemoryInterface):
         elif transfer_size == 8:
             self._link.write_mem8(addr, [data], self._apsel)
         
-    ## @brief Read a memory location.
-    #
-    # By default, a word will be read.
     def read_memory(self, addr, transfer_size=32, now=True):
+        """! @brief Read a memory location.
+        
+        By default, a word will be read.
+        """
         assert transfer_size in (8, 16, 32)
+        addr &= 0xffffffff
         if transfer_size == 32:
             result = conversion.byte_list_to_u32le_list(self._link.read_mem32(addr, 4, self._apsel))[0]
         elif transfer_size == 16:
@@ -257,8 +264,27 @@ class STLinkMemoryInterface(MemoryInterface):
         return result if now else read_callback
 
     def write_memory_block32(self, addr, data):
+        addr &= 0xffffffff
         self._link.write_mem32(addr, conversion.u32le_list_to_byte_list(data), self._apsel)
 
     def read_memory_block32(self, addr, size):
+        addr &= 0xffffffff
         return conversion.byte_list_to_u32le_list(self._link.read_mem32(addr, size * 4, self._apsel))
 
+class StlinkProbePlugin(Plugin):
+    """! @brief Plugin class for StlLinkProbe."""
+    
+    def should_load(self):
+        # TODO only load the plugin when libusb is available
+        return True
+    
+    def load(self):
+        return StlinkProbe
+    
+    @property
+    def name(self):
+        return "stlink"
+    
+    @property
+    def description(self):
+        return "STMicro STLinkV2 and STLinkV3 debug probe"
