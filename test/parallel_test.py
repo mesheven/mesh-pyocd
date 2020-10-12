@@ -1,52 +1,27 @@
-"""
- mbed CMSIS-DAP debugger
- Copyright (c) 2016 ARM Limited
-
- Licensed under the Apache License, Version 2.0 (the "License");
- you may not use this file except in compliance with the License.
- You may obtain a copy of the License at
-
-     http://www.apache.org/licenses/LICENSE-2.0
-
- Unless required by applicable law or agreed to in writing, software
- distributed under the License is distributed on an "AS IS" BASIS,
- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- See the License for the specific language governing permissions and
- limitations under the License.
-"""
+# pyOCD debugger
+# Copyright (c) 2016-2020 Arm Limited
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from __future__ import print_function
 
-from pyocd.core.helpers import ConnectHelper
-from pyocd.probe.pydapaccess import DAPAccess
 import threading
 import multiprocessing
 
+from pyocd.core.helpers import ConnectHelper
+from pyocd.probe.pydapaccess import DAPAccess
 
-def run_in_parallel(function, args_list):
-    """Create and run a thread in parallel for each element in args_list
-
-    Wait until all threads finish executing. Throw an exception if an exception
-    occurred on any of the threads.
-    """
-    def _thread_helper(idx, func, args):
-        """Run the function and set result to True if there was not error"""
-        func(*args)
-        result_list[idx] = True
-
-    result_list = [False] * len(args_list)
-    thread_list = []
-    for idx, args in enumerate(args_list):
-        thread = threading.Thread(target=_thread_helper,
-                                  args=(idx, function, args))
-        thread.start()
-        thread_list.append(thread)
-
-    for thread in thread_list:
-        thread.join()
-    for result in result_list:
-        if result is not True:
-            raise Exception("Running in thread failed")
-
+from test_util import run_in_parallel
 
 def run_in_processes(function, args_list):
     """Create and run a processes in parallel for each element in args_list
@@ -88,7 +63,7 @@ def search_and_lock(board_id):
         device = DAPAccess.get_device(board_id)
         device.open()
         device.close()
-        with ConnectHelper.session_with_chosen_probe(board_id=board_id):
+        with ConnectHelper.session_with_chosen_probe(unique_id=board_id):
             pass
 
 

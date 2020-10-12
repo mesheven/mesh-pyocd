@@ -1,38 +1,45 @@
 #!/usr/bin/env python
-"""
- mbed CMSIS-DAP debugger
- Copyright (c) 2015-2018 ARM Limited
-
- Licensed under the Apache License, Version 2.0 (the "License");
- you may not use this file except in compliance with the License.
- You may obtain a copy of the License at
-
-     http://www.apache.org/licenses/LICENSE-2.0
-
- Unless required by applicable law or agreed to in writing, software
- distributed under the License is distributed on an "AS IS" BASIS,
- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- See the License for the specific language governing permissions and
- limitations under the License.
-"""
+# pyOCD debugger
+# Copyright (c) 2015-2020 Arm Limited
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from __future__ import print_function
 
-import os, sys
-
-parentdir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, parentdir)
+import os
+import sys
+import logging
+from time import time
+import argparse
+from xml.etree import ElementTree
+import multiprocessing as mp
+import io
 
 from pyocd.core.session import Session
 from pyocd.core.helpers import ConnectHelper
 from pyocd.utility.conversion import float32_to_u32
 from pyocd.probe.aggregator import DebugProbeAggregator
-import logging
-from time import time
-from test_util import (TestResult, Test, IOTee, RecordingLogHandler, get_session_options)
-import argparse
-from xml.etree import ElementTree
-import multiprocessing as mp
-import io
+
+from test_util import (
+    get_env_file_name,
+    TestResult,
+    Test,
+    IOTee,
+    RecordingLogHandler,
+    get_session_options,
+    ensure_output_dir,
+    TEST_OUTPUT_DIR,
+    )
 
 from basic_test import BasicTest
 from speed_test import SpeedTest
@@ -40,29 +47,37 @@ from cortex_test import CortexTest
 from flash_test import FlashTest
 from flash_loader_test import FlashLoaderTest
 from gdb_test import GdbTest
-from gdb_server_json_test import GdbServerJsonTest
+from json_lists_test import JsonListsTest
 from connect_test import ConnectTest
+from debug_context_test import DebugContextTest
+from concurrency_test import ConcurrencyTest
+from commands_test import CommandsTest
 
-XML_RESULTS = "test_results.xml"
+XML_RESULTS_TEMPLATE = "test_results{}.xml"
+LOG_FILE_TEMPLATE = "automated_test_result{}.txt"
+SUMMARY_FILE_TEMPLATE = "automated_test_summary{}.txt"
 
 LOG_FORMAT = "%(relativeCreated)07d:%(levelname)s:%(module)s:%(message)s"
 
-LOG_FILE = "automated_test_result.txt"
-SUMMARY_FILE = "automated_test_summary.txt"
-
 JOB_TIMEOUT = 30 * 60 # 30 minutes
 
-# Put together list of tests.
-test_list = [
+# Put together list of all tests.
+all_tests = [
              BasicTest(),
-             GdbServerJsonTest(),
+             JsonListsTest(),
              ConnectTest(),
              SpeedTest(),
              CortexTest(),
+             ConcurrencyTest(),
              FlashTest(),
              FlashLoaderTest(),
+             DebugContextTest(),
              GdbTest(),
+             CommandsTest(),
              ]
+
+# Actual list used at runtime, filted by command line args.
+test_list = []
 
 def print_summary(test_list, result_list, test_time, output_file=None):
     for test in test_list:
@@ -129,7 +144,8 @@ def generate_xml_results(result_list):
     root.set('failures', str(total_failures))
     root.set('time', "%.3f" % total_time)
     
-    ElementTree.ElementTree(root).write(XML_RESULTS, encoding="UTF-8", xml_declaration=True)
+    xml_results = os.path.join(TEST_OUTPUT_DIR, XML_RESULTS_TEMPLATE.format(get_env_file_name()))
+    ElementTree.ElementTree(root).write(xml_results, encoding="UTF-8", xml_declaration=True)
 
 def print_board_header(outputFile, board, n, includeDividers=True, includeLeadingNewline=False):
     header = "TESTING BOARD {name} [{target}] [{uid}] #{n}".format(
@@ -144,22 +160,23 @@ def print_board_header(outputFile, board, n, includeDividers=True, includeLeadin
     if includeDividers:
         print(divider + "\n", file=outputFile)
 
-## @brief Run all tests on a given board.
-#
-# When multiple test jobs are being used, this function is the entry point executed in
-# child processes.
-#
-# Always writes both stdout and log messages of tests to a board-specific log file, and saves
-# the output for each test to a string that is stored in the TestResult object. Depending on
-# the logToConsole and commonLogFile parameters, output may also be copied to the console
-# (sys.stdout) and/or a common log file for all boards.
-#
-# @param board_id Unique ID of the board to test.
-# @param n Unique index of the test run.
-# @param loglevel Log level passed to logger instance. Usually INFO or DEBUG.
-# @param logToConsole Boolean indicating whether output should be copied to sys.stdout.
-# @param commonLogFile If not None, an open file object to which output should be copied.
 def test_board(board_id, n, loglevel, logToConsole, commonLogFile):
+    """! @brief Run all tests on a given board.
+    
+    When multiple test jobs are being used, this function is the entry point executed in
+    child processes.
+    
+    Always writes both stdout and log messages of tests to a board-specific log file, and saves
+    the output for each test to a string that is stored in the TestResult object. Depending on
+    the logToConsole and commonLogFile parameters, output may also be copied to the console
+    (sys.stdout) and/or a common log file for all boards.
+    
+    @param board_id Unique ID of the board to test.
+    @param n Unique index of the test run.
+    @param loglevel Log level passed to logger instance. Usually INFO or DEBUG.
+    @param logToConsole Boolean indicating whether output should be copied to sys.stdout.
+    @param commonLogFile If not None, an open file object to which output should be copied.
+    """
     probe = DebugProbeAggregator.get_probe_with_id(board_id)
     assert probe is not None
     session = Session(probe, **get_session_options())
@@ -168,11 +185,25 @@ def test_board(board_id, n, loglevel, logToConsole, commonLogFile):
     originalStdout = sys.stdout
     originalStderr = sys.stderr
 
-    # Open board-specific output file.
-    log_filename = "automated_test_results_%s_%d.txt" % (board.name, n)
+    # Set up board-specific output file. A previously existing file is removed.
+    env_name = (("_" + os.environ['TOX_ENV_NAME']) if ('TOX_ENV_NAME' in os.environ) else '')
+    name_info = "{}_{}_{}".format(env_name, board.name, n)
+    log_filename = os.path.join(TEST_OUTPUT_DIR, LOG_FILE_TEMPLATE.format(name_info))
     if os.path.exists(log_filename):
         os.remove(log_filename)
-    log_file = open(log_filename, "a", buffering=1) # 1=Unbuffered
+    
+    # Skip board if specified in the config.
+    if session.options['skip_test']:
+        print("Skipping board %s due as specified in config" % board.unique_id)
+        return []
+    # Skip this board if we don't have a test binary.
+    if board.test_binary is None:
+        print("Skipping board %s due to missing test binary" % board.unique_id)
+        return []
+
+    # Open board-specific output file. This is done after skipping so a skipped board doesn't have a
+    # log file created for it (but a previous log file will be removed, above).
+    log_file = open(log_filename, "w", buffering=1) # 1=Line buffered
     
     # Setup logging.
     log_handler = RecordingLogHandler(None)
@@ -188,11 +219,6 @@ def test_board(board_id, n, loglevel, logToConsole, commonLogFile):
         if commonLogFile:
             print_board_header(commonLogFile, board, n, includeLeadingNewline=(n != 0))
         print_board_header(originalStdout, board, n, logToConsole, includeLeadingNewline=(n != 0))
-        
-        # Skip this board if we don't have a test binary.
-        if board.test_binary is None:
-            print("Skipping board %s due to missing test binary" % board.unique_id)
-            return result_list
 
         # Run all tests on this board.
         for test in test_list:
@@ -237,6 +263,25 @@ def test_board(board_id, n, loglevel, logToConsole, commonLogFile):
         log_handler.close()
     return result_list
 
+def filter_tests(args):
+    """! @brief Generate the list of tests to run based on arguments."""
+    if args.exclude_tests and args.include_tests:
+        print("Please only include or exclude tests, not both simultaneously.")
+        sys.exit(1)
+    excludes = [t.strip().lower() for t in args.exclude_tests.split(',')] if args.exclude_tests else []
+    includes = [t.strip().lower() for t in args.include_tests.split(',')] if args.include_tests else []
+    
+    for test in all_tests:
+        if excludes:
+            include_it = (test.name.lower() not in excludes)
+        elif includes:
+            include_it = (test.name.lower() in includes)
+        else:
+            include_it = True
+        
+        if include_it:
+            test_list.append(test)
+
 def main():
     parser = argparse.ArgumentParser(description='pyOCD automated testing')
     parser.add_argument('-d', '--debug', action="store_true", help='Enable debug logging')
@@ -244,13 +289,21 @@ def main():
     parser.add_argument('-j', '--jobs', action="store", default=1, type=int, metavar="JOBS",
         help='Set number of concurrent board tests (default is 1)')
     parser.add_argument('-b', '--board', action="append", metavar="ID", help="Limit testing to boards with specified unique IDs. Multiple boards can be listed.")
+    parser.add_argument('-l', '--list-tests', action="store_true", help="Print a list of tests that will be run.")
+    parser.add_argument('-x', '--exclude-tests', metavar="TESTS", default="", help="Comma-separated list of tests to exclude.")
+    parser.add_argument('-i', '--include-tests', metavar="TESTS", default="", help="Comma-separated list of tests to include.")
     args = parser.parse_args()
     
-    # Force jobs to 1 when running under CI until concurrency issues with enumerating boards are
-    # solved. Specifically, the connect test has intermittently failed to open boards on Linux and
-    # Win7. This is only done under CI, and in this script, to make testing concurrent runs easy.
-    if 'CI_TEST' in os.environ:
-        args.jobs = 1
+    # Allow CI to override the number of concurrent jobs.
+    if 'CI_JOBS' in os.environ:
+        args.jobs = int(os.environ['CI_JOBS'])
+    
+    filter_tests(args)
+    
+    if args.list_tests:
+        for test in test_list:
+            print(test.name)
+        return
     
     # Disable multiple jobs on macOS prior to Python 3.4. By default, multiprocessing uses
     # fork() on Unix, which doesn't work on the Mac because CoreFoundation requires exec()
@@ -261,14 +314,17 @@ def main():
         print("WARNING: Cannot support multiple jobs on macOS prior to Python 3.4. Forcing 1 job.")
         args.jobs = 1
 
+    ensure_output_dir()
+    
     # Setup logging based on concurrency and quiet option.
     level = logging.DEBUG if args.debug else logging.INFO
     if args.jobs == 1 and not args.quiet:
+        log_file = os.path.join(TEST_OUTPUT_DIR, LOG_FILE_TEMPLATE.format(get_env_file_name()))
         # Create common log file.
-        if os.path.exists(LOG_FILE):
-            os.remove(LOG_FILE)
+        if os.path.exists(log_file):
+            os.remove(log_file)
         logToConsole = True
-        commonLogFile = open(LOG_FILE, "a")
+        commonLogFile = open(log_file, "a")
     else:
         logToConsole = False
         commonLogFile = None
@@ -308,7 +364,8 @@ def main():
     test_time = (stop - start)
 
     print_summary(test_list, result_list, test_time)
-    with open(SUMMARY_FILE, "w") as output_file:
+    summary_file = os.path.join(TEST_OUTPUT_DIR, SUMMARY_FILE_TEMPLATE.format(get_env_file_name()))
+    with open(summary_file, "w") as output_file:
         print_summary(test_list, result_list, test_time, output_file)
     generate_xml_results(result_list)
     

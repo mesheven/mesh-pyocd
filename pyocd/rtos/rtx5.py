@@ -1,29 +1,29 @@
-"""
- mbed CMSIS-DAP debugger
- Copyright (c) 2016 ARM Limited
-
- Licensed under the Apache License, Version 2.0 (the "License");
- you may not use this file except in compliance with the License.
- You may obtain a copy of the License at
-
-     http://www.apache.org/licenses/LICENSE-2.0
-
- Unless required by applicable law or agreed to in writing, software
- distributed under the License is distributed on an "AS IS" BASIS,
- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- See the License for the specific language governing permissions and
- limitations under the License.
-"""
+# pyOCD debugger
+# Copyright (c) 2016-2020 Arm Limited
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from .provider import (TargetThread, ThreadProvider)
-from .common import (read_c_string, HandlerModeThread)
+from .common import (read_c_string, HandlerModeThread, EXC_RETURN_EXT_FRAME_MASK)
 from ..core import exceptions
 from ..core.target import Target
+from ..core.plugin import Plugin
 from ..debug.context import DebugContext
-from ..coresight.cortex_m import (CORE_REGISTER, register_name_to_index)
+from ..coresight.cortex_m_core_registers import index_for_reg
 import logging
 
 # Create a logger for this module.
-log = logging.getLogger("rtx5")
+LOG = logging.getLogger(__name__)
 
 class TargetList(object):
     def __init__(self, context, ptr, nextOffset):
@@ -43,11 +43,12 @@ class TargetList(object):
                 # Read the next item in the list.
                 node = self._context.read32(node + self._offset)
             except exceptions.TransferError as exc:
-                log.warning("TransferError while reading list elements (list=0x%08x, node=0x%08x), terminating list: %s", self._list, node, exc)
+                LOG.warning("TransferError while reading list elements (list=0x%08x, node=0x%08x), terminating list: %s", self._list, node, exc)
                 break
 
-## @brief
 class RTXThreadContext(DebugContext):
+    """! @brief Thread context for RTX5."""
+    
     # SP/PSP are handled specially, so it is not in these dicts.
 
     # Offsets are relative to stored SP in a task switch block, for the
@@ -130,14 +131,13 @@ class RTXThreadContext(DebugContext):
                  # (reserved word: 196)
             }
 
-    def __init__(self, parentContext, thread):
-        super(RTXThreadContext, self).__init__(parentContext.core)
-        self._parent = parentContext
+    def __init__(self, parent, thread):
+        super(RTXThreadContext, self).__init__(parent)
         self._thread = thread
-        self._has_fpu = parentContext.core.has_fpu
+        self._has_fpu = self.core.has_fpu
 
     def read_core_registers_raw(self, reg_list):
-        reg_list = [register_name_to_index(reg) for reg in reg_list]
+        reg_list = [index_for_reg(reg) for reg in reg_list]
         reg_vals = []
 
         isCurrent = self._thread.is_current
@@ -163,7 +163,7 @@ class RTXThreadContext(DebugContext):
         table = self.NOFPU_REGISTER_OFFSETS
         if self._has_fpu:
             try:
-                if inException and self._parent.core.is_vector_catch():
+                if inException and self.core.is_vector_catch():
                     # Vector catch has just occurred, take live LR
                     exceptionLR = self._parent.read_core_register('lr')
                 else:
@@ -173,12 +173,12 @@ class RTXThreadContext(DebugContext):
                     exceptionLR = self._thread.get_stack_frame()
 
                 # Check bit 4 of the exception LR to determine if FPU registers were stacked.
-                if (exceptionLR & (1 << 4)) == 0:
+                if (exceptionLR & EXC_RETURN_EXT_FRAME_MASK) == 0:
                     table = self.FPU_REGISTER_OFFSETS
                     hwStacked = 0x68
                     swStacked = 0x60
             except exceptions.TransferError:
-                log.debug("Transfer error while reading thread's saved LR")
+                LOG.debug("Transfer error while reading thread's saved LR")
 
         for reg in reg_list:
 
@@ -209,11 +209,9 @@ class RTXThreadContext(DebugContext):
 
         return reg_vals
 
-    def write_core_registers_raw(self, reg_list, data_list):
-        self._parent.write_core_registers_raw(reg_list, data_list)
-
-## @brief Base class representing a thread on the target.
 class RTXTargetThread(TargetThread):
+    """! @brief Represents an RTX5 thread on the target."""
+
     STATE_OFFSET = 1
     NAME_OFFSET = 4
     PRIORITY_OFFSET = 33
@@ -252,16 +250,16 @@ class RTXTargetThread(TargetThread):
             
             self.update_state()
         except exceptions.TransferError as exc:
-            log.debug("Transfer error while reading thread %x name: %s", self._base, exc)
+            LOG.debug("Transfer error while reading thread %x name: %s", self._base, exc)
             self._name = "?"
-        log.debug('RTXTargetThread 0x%x' % base)
+        LOG.debug('RTXTargetThread 0x%x' % base)
     
     def update_state(self):
         try:
             state = self._target_context.read8(self._base + RTXTargetThread.STATE_OFFSET)
             priority = self._target_context.read8(self._base + RTXTargetThread.PRIORITY_OFFSET)
         except exceptions.TransferError as exc:
-            log.debug("Transfer error while reading thread %x state: %s", self._base, exc)
+            LOG.debug("Transfer error while reading thread %x state: %s", self._base, exc)
         else:
             self._state = state
             self._priority = priority
@@ -281,7 +279,7 @@ class RTXTargetThread(TargetThread):
 
     @property
     def description(self):
-        return "%s; Priority %d" % (self.STATES[self._state], self.priority)
+        return "%s; Priority %d" % (self.STATES.get(self._state, "(Invalid)"), self.priority)
 
     @property
     def name(self):
@@ -296,7 +294,7 @@ class RTXTargetThread(TargetThread):
         try:
             return self._target_context.read32(self._base + RTXTargetThread.SP_OFFSET)
         except exceptions.TransferError:
-            log.debug("Transfer error while reading thread's stack pointer @ 0x%08x", self._base + RTXTargetThread.SP_OFFSET)
+            LOG.debug("Transfer error while reading thread's stack pointer @ 0x%08x", self._base + RTXTargetThread.SP_OFFSET)
             return 0
 
     def get_stack_frame(self):
@@ -305,11 +303,12 @@ class RTXTargetThread(TargetThread):
         try:
             return self._target_context.read8(self._base + RTXTargetThread.STACKFRAME_OFFSET) | 0xFFFFFF00
         except exceptions.TransferError:
-            log.debug("Transfer error while reading thread's stack frame @ 0x%08x", self._base + RTXTargetThread.STACKFRAME_OFFSET)
+            LOG.debug("Transfer error while reading thread's stack frame @ 0x%08x", self._base + RTXTargetThread.STACKFRAME_OFFSET)
             return 0xFFFFFFFD
 
-## @brief Thread provider for RTX5 RTOS.
 class RTX5ThreadProvider(ThreadProvider):
+    """! @brief Thread provider for RTX5 RTOS."""
+
     # Offsets in osRtxInfo_t
     KERNEL_STATE_OFFSET = 8
     CURRENT_OFFSET = 20
@@ -329,15 +328,15 @@ class RTX5ThreadProvider(ThreadProvider):
         self._os_rtx_info = symbolProvider.get_symbol_value('osRtxInfo')
         if self._os_rtx_info is None:
             return False
-        log.debug('osRtxInfo = 0x%08x', self._os_rtx_info)
+        LOG.debug('osRtxInfo = 0x%08x', self._os_rtx_info)
         self._readylist = self._os_rtx_info + RTX5ThreadProvider.THREADLIST_OFFSET
         self._delaylist = self._os_rtx_info + RTX5ThreadProvider.DELAYLIST_OFFSET
         self._waitlist = self._os_rtx_info + RTX5ThreadProvider.WAITLIST_OFFSET
         self._threads = {}
         self._current = None
         self._current_id = None
-        self._target.root_target.subscribe(Target.EVENT_POST_FLASH_PROGRAM, self.event_handler)
-        self._target.subscribe(Target.EVENT_POST_RESET, self.event_handler)
+        self._target.session.subscribe(self.event_handler, Target.Event.POST_FLASH_PROGRAM)
+        self._target.session.subscribe(self.event_handler, Target.Event.POST_RESET)
         return True
 
     def get_threads(self):
@@ -402,7 +401,15 @@ class RTX5ThreadProvider(ThreadProvider):
 
     @property
     def is_enabled(self):
-        return self.get_is_active()
+        if self._os_rtx_info is None:
+            return False
+        try:
+            # If we're in Thread mode on the main stack, can't be active, even
+            # if kernel state says we are (eg post reset)
+            return self.get_kernel_state() != 0 and not self._target.in_thread_mode_on_main_stack()
+        except exceptions.TransferError as exc:
+            LOG.debug("Transfer error checking if enabled: %s", exc)
+            return False
 
     @property
     def current_thread(self):
@@ -413,7 +420,7 @@ class RTX5ThreadProvider(ThreadProvider):
         try:
             return self._threads[id]
         except KeyError:
-            log.debug("key error getting current thread id=%s; self._threads = %s",
+            LOG.debug("key error getting current thread id=%s; self._threads = %s",
                 ("%x" % id) if (id is not None) else id, repr(self._threads))
             return None
 
@@ -436,13 +443,19 @@ class RTX5ThreadProvider(ThreadProvider):
         self.update_threads()
         return self._current_id
 
-    def get_is_active(self):
-        if self._os_rtx_info is None:
-            return False
-        try:
-            state = self._target_context.read8(self._os_rtx_info + RTX5ThreadProvider.KERNEL_STATE_OFFSET)
-        except exceptions.TransferError as exc:
-            log.debug("Transfer error reading kernel state: %s", exc)
-            return False
-        else:
-            return state != 0
+    def get_kernel_state(self):
+        return self._target_context.read8(self._os_rtx_info + RTX5ThreadProvider.KERNEL_STATE_OFFSET)
+
+class RTX5Plugin(Plugin):
+    """! @brief Plugin class for the RTX5 RTOS."""
+    
+    def load(self):
+        return RTX5ThreadProvider
+    
+    @property
+    def name(self):
+        return "rtx5"
+    
+    @property
+    def description(self):
+        return "RTX5"

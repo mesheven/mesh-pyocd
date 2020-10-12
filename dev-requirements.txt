@@ -6,3 +6,5 @@ pytest-cov
 coverage
 elapsedtimer
 pylint
+tox
+mock;python_version<"3.3"

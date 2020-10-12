@@ -1,22 +1,20 @@
-"""
- mbed CMSIS-DAP debugger
- Copyright (c) 2015 ARM Limited
-
- Licensed under the Apache License, Version 2.0 (the "License");
- you may not use this file except in compliance with the License.
- You may obtain a copy of the License at
-
-     http://www.apache.org/licenses/LICENSE-2.0
-
- Unless required by applicable law or agreed to in writing, software
- distributed under the License is distributed on an "AS IS" BASIS,
- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- See the License for the specific language governing permissions and
- limitations under the License.
-"""
+# pyOCD debugger
+# Copyright (c) 2015 Arm Limited
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 import os
-import logging
 from ..debug.semihost import SemihostIOHandler
 
 # Open mode flags
@@ -33,9 +31,9 @@ O_EXCL = 0x800
 # non-zero for semihosting).
 FD_OFFSET = 4
 
-##
-# @brief Semihosting file I/O handler that performs GDB syscalls.
 class GDBSyscallIOHandler(SemihostIOHandler):
+    """! @brief Semihosting file I/O handler that performs GDB syscalls."""
+
     def __init__(self, server):
         super(GDBSyscallIOHandler, self).__init__()
         self._server = server
@@ -104,7 +102,7 @@ class GDBSyscallIOHandler(SemihostIOHandler):
     def seek(self, fd, pos):
         fd -= FD_OFFSET
         result, self._errno = self._server.syscall('lseek,%x,%x,0' % (fd, pos))
-        return 0 if result is not -1 else -1
+        return 0 if result != -1 else -1
 
     def flen(self, fd):
         fd -= FD_OFFSET

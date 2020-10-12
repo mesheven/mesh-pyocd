@@ -1,46 +1,88 @@
-"""
- mbed CMSIS-DAP debugger
- Copyright (c) 2015-2018 ARM Limited
+# pyOCD debugger
+# Copyright (c) 2015-2020 Arm Limited
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
- Licensed under the Apache License, Version 2.0 (the "License");
- you may not use this file except in compliance with the License.
- You may obtain a copy of the License at
-
-     http://www.apache.org/licenses/LICENSE-2.0
-
- Unless required by applicable law or agreed to in writing, software
- distributed under the License is distributed on an "AS IS" BASIS,
- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- See the License for the specific language governing permissions and
- limitations under the License.
-"""
-
-from ..core import exceptions
-from ..probe.debug_probe import DebugProbe
-from .ap import (MEM_AP_CSW, LOG_DAP, APSEL, APBANKSEL, APREG_MASK, AccessPort)
-from ..utility.sequencer import CallSequence
 import logging
-import logging.handlers
-import os
-import os.path
 import six
+from collections import namedtuple
+from enum import Enum
 
-# DP register addresses.
-DP_IDCODE = 0x0 # read-only
-DP_ABORT = 0x0 # write-only
-DP_CTRL_STAT = 0x4 # read-write
+from ..core import (exceptions, memory_interface)
+from ..probe.debug_probe import DebugProbe
+from ..probe.swj import SWJSequenceSender
+from .ap import (MEM_AP_CSW, APSEL, APBANKSEL, APSEL_APBANKSEL, APREG_MASK, AccessPort)
+from ..utility.sequencer import CallSequence
+from ..utility.timeout import Timeout
+
+LOG = logging.getLogger(__name__)
+
+TRACE = LOG.getChild("trace")
+TRACE.setLevel(logging.CRITICAL)
+
+# DP register addresses. The DPBANKSEL value is encoded in bits [7:4].
+DP_IDR = 0x00 # read-only
+DP_IDR1 = 0x10 # read-only
+DP_BASEPTR0 = 0x20 # read-only
+DP_BASEPTR1 = 0x30 # read-only
+DP_ABORT = 0x00 # write-only
+DP_CTRL_STAT = 0x04 # read-write
+DP_DLCR = 0x14 # read-write
+DP_TARGETID = 0x24 # read-only
+DP_DLPIDR = 0x34 # read-only
+DP_EVENTSTAT = 0x44 # read-only
+DP_SELECT1 = 0x54 # write-only
 DP_SELECT = 0x8 # write-only
 DP_RDBUFF = 0xC # read-only
 
+# Mask and shift for extracting DPBANKSEL from our DP register address constants. These are not
+# related to the SELECT.DPBANKSEL bitfield.
+DPADDR_MASK = 0x0f
+DPADDR_DPBANKSEL_MASK = 0xf0
+DPADDR_DPBANKSEL_SHIFT = 4
+
+DPIDR1_ASIZE_MASK = 0x00000007f
+DPIDR1_ERRMODE_MASK = 0x00000080
+
+BASEPTR0_VALID_MASK = 0x00000001
+BASEPTR0_PTR_MASK = 0xfffff000
+BASEPTR0_PTR_SHIFT = 12
+
+ABORT_DAPABORT = 0x00000001
+ABORT_STKCMPCLR = 0x00000002
 ABORT_STKERRCLR = 0x00000004
+ABORT_WDERRCLR = 0x00000008
+ABORT_ORUNERRCLR = 0x00000010
 
 # DP Control / Status Register bit definitions
+CTRLSTAT_ORUNDETECT = 0x00000001
 CTRLSTAT_STICKYORUN = 0x00000002
 CTRLSTAT_STICKYCMP = 0x00000010
 CTRLSTAT_STICKYERR = 0x00000020
+CTRLSTAT_READOK = 0x00000040
+CTRLSTAT_WDATAERR = 0x00000080
 
-DPIDR_MIN_MASK = 0x10000
-DPIDR_VERSION_MASK = 0xf000
+# DP SELECT register fields.
+SELECT_DPBANKSEL_MASK = 0x0000000f
+SELECT_APADDR_MASK = 0xfffffff0
+
+DPIDR_REVISION_MASK = 0xf0000000
+DPIDR_REVISION_SHIFT = 28
+DPIDR_PARTNO_MASK = 0x0ff00000
+DPIDR_PARTNO_SHIFT = 20
+DPIDR_MIN_MASK = 0x00010000
+DPIDR_VERSION_MASK = 0x0000f000
 DPIDR_VERSION_SHIFT = 12
 
 CSYSPWRUPACK = 0x80000000
@@ -51,67 +93,251 @@ CDBGPWRUPREQ = 0x10000000
 TRNNORMAL = 0x00000000
 MASKLANE = 0x00000f00
 
-class DebugPort(object):
-    # DAP log file name.
-    DAP_LOG_FILE = "pyocd_dap.log"
+## Arbitrary 5 second timeout for DP power up/down requests.
+DP_POWER_REQUEST_TIMEOUT = 5.0
 
-    def __init__(self, link, target):
-        self.link = link
+## @brief Class to hold fields from DP IDR register.
+DPIDR = namedtuple('DPIDR', 'idr partno version revision mindp')
+
+class ADIVersion(Enum):
+    """! @brief Supported versions of the Arm Debug Interface."""
+    ADIv5 = 5
+    ADIv6 = 6
+
+class DPConnector(object):
+    """! @brief Establishes a connection to the DP for a given wire protocol.
+    
+    This class will ask the probe to connect using a given wire protocol. Then it makes multiple
+    attempts at sending the SWJ sequence to select the wire protocol and read the DP IDR register.
+    """
+    
+    def __init__(self, probe):
+        self._probe = probe
+        self._session = probe.session
+        self._idr = None
+    
+    @property
+    def idr(self):
+        """! @brief DPIDR instance containing values read from the DP IDR register."""
+        return self._idr
+    
+    def connect(self, protocol=None):
+        """! @brief Establish a connection to the DP.
+        
+        This method causes the debug probe to connect using the wire protocol.
+        
+        @param self
+        @param protocol One of the @ref pyocd.probe.debug_probe.DebugProbe.Protocol
+            "DebugProbe.Protocol" enums. If not provided, will default to the `dap_protocol` setting.
+        
+        @exception DebugError
+        @exception TransferError
+        """
+        protocol_name = self._session.options.get('dap_protocol').strip().lower()
+        send_swj = self._session.options.get('dap_swj_enable') \
+                and (DebugProbe.Capability.SWJ_SEQUENCE in self._probe.capabilities)
+        use_dormant = self._session.options.get('dap_swj_use_dormant')
+
+        # Convert protocol from setting if not passed as parameter.
+        if protocol is None:
+            protocol = DebugProbe.PROTOCOL_NAME_MAP[protocol_name]
+            if protocol not in self._probe.supported_wire_protocols:
+                raise exceptions.DebugError("requested wire protocol %s not supported by the debug probe" % protocol.name)
+        if protocol != DebugProbe.Protocol.DEFAULT:
+            LOG.debug("Using %s wire protocol", protocol.name)
+            
+        # Connect using the selected protocol.
+        self._probe.connect(protocol)
+
+        # Log the actual protocol if selected was default.
+        if protocol == DebugProbe.Protocol.DEFAULT:
+            protocol = self._probe.wire_protocol
+            LOG.debug("Default wire protocol selected; using %s", protocol.name)
+        
+        # Create object to send SWJ sequences.
+        swj = SWJSequenceSender(self._probe, use_dormant)
+        
+        # Multiple attempts to select protocol and read DP IDR.
+        for attempt in range(4):
+            try:
+                if send_swj:
+                    swj.select_protocol(protocol)
+                
+                # Attempt to read the DP IDR register.
+                self._idr = self.read_idr()
+                
+                # Successful connection so exit the loop.
+                break
+            except exceptions.TransferError:
+                # If not sending the SWJ sequence, just reraise; there's nothing more to do.
+                if not send_swj:
+                    raise
+                
+                # If the read of the DP IDCODE fails, retry SWJ sequence. The DP may have been
+                # in a state where it thought the SWJ sequence was an invalid transfer. We also
+                # try enabling use of dormant state if it wasn't already enabled.
+                LOG.debug("DP IDCODE read failed; resending SWJ sequence (use dormant=%s)", use_dormant)
+                
+                if attempt == 1:
+                    # If already using dormant mode, just raise, we don't need to retry the same mode.
+                    if use_dormant:
+                        raise
+                    
+                    # After the second attempt, switch to enabling dormant mode.
+                    swj.use_dormant = True
+                elif attempt == 3:
+                    # After 4 attempts, we let the exception propagate.
+                    raise
+
+    def read_idr(self):
+        """! @brief Read IDR register and get DP version"""
+        dpidr = self._probe.read_dp(DP_IDR, now=True)
+        dp_partno = (dpidr & DPIDR_PARTNO_MASK) >> DPIDR_PARTNO_SHIFT
+        dp_version = (dpidr & DPIDR_VERSION_MASK) >> DPIDR_VERSION_SHIFT
+        dp_revision = (dpidr & DPIDR_REVISION_MASK) >> DPIDR_REVISION_SHIFT
+        is_mindp = (dpidr & DPIDR_MIN_MASK) != 0
+        return DPIDR(dpidr, dp_partno, dp_version, dp_revision, is_mindp)
+
+class DebugPort(object):
+    """! @brief Represents the Arm Debug Interface (ADI) Debug Port (DP)."""
+    
+    def __init__(self, probe, target):
+        self._probe = probe
         self.target = target
         self.valid_aps = None
+        self.dpidr = None
         self.aps = {}
         self._access_number = 0
-        if LOG_DAP:
-            self._setup_logging()
+        self._cached_dp_select = None
+        self._protocol = None
+        self._probe_managed_ap_select = False
+        self._probe_managed_dpbanksel = False
+        self._probe_supports_dpbanksel = False
+        
+        # DPv3 attributes
+        self._is_dpv3 = False
+        self._addr_size = None
+        self._addr_mask = None
+        self._errmode = None
+        self._base_addr = None
+        self._apacc_mem_interface = None
 
+    @property
+    def probe(self):
+        return self._probe
+    
+    @property
+    def adi_version(self):
+        return ADIVersion.ADIv6 if self._is_dpv3 else ADIVersion.ADIv5
+    
+    @property
+    def base_address(self):
+        """! @brief Base address of the first component for an ADIv6 system."""
+        return self._base_addr
+    
+    @property
+    def apacc_memory_interface(self):
+        """! @brief Memory interface for performing APACC transactions."""
+        if self._apacc_mem_interface is None:
+            self._apacc_mem_interface = APAccessMemoryInterface(self)
+        return self._apacc_mem_interface
+    
     @property
     def next_access_number(self):
         self._access_number += 1
         return self._access_number
+    
+    def lock(self):
+        """! @brief Lock the DP from access by other threads."""
+        self.probe.lock()
+    
+    def unlock(self):
+        """! @brief Unlock the DP."""
+        self.probe.unlock()
 
-    ## @brief Set up DAP logging.
-    #
-    # A memory handler is created that buffers log records before flushing them to a file
-    # handler that writes to DAP_LOG_FILE. This improves logging performance by writing to the
-    # log file less often.
-    def _setup_logging(self):
-        cwd = os.getcwd()
-        logfile = os.path.join(cwd, self.DAP_LOG_FILE)
-        logging.info("dap logfile: %s", logfile)
-        self.logger = logging.getLogger('dap')
-        self.logger.propagate = False
-        formatter = logging.Formatter('%(relativeCreated)010dms:%(levelname)s:%(name)s:%(message)s')
-        fileHandler = logging.FileHandler(logfile, mode='w+', delay=True)
-        fileHandler.setFormatter(formatter)
-        memHandler = logging.handlers.MemoryHandler(capacity=128, target=fileHandler)
-        self.logger.addHandler(memHandler)
-        self.logger.setLevel(logging.DEBUG)
+    def init(self, protocol=None):
+        """! @brief Connect to the target.
+        
+        This method causes the debug probe to connect using the selected wire protocol. The probe
+        must have already been opened prior to this call.
+        
+        Unlike init_sequence(), this method is intended to be used when manually constructing a
+        DebugPort instance. It simply calls init_sequence() and invokes the returned call sequence.
+        
+        @param self
+        @param protocol One of the @ref pyocd.probe.debug_probe.DebugProbe.Protocol
+            "DebugProbe.Protocol" enums. If not provided, will default to the `protocol` setting.
+        """
+        self._protocol = protocol
+        self.init_sequence().invoke()
 
-    def init(self):
-        # Connect to the target.
-        self.link.connect()
-        self.link.swj_sequence()
-        try:
-            self.read_id_code()
-        except exceptions.TransferError:
-            # If the read of the DP IDCODE fails, retry SWJ sequence. The DP may have been
-            # in a state where it thought the SWJ sequence was an invalid transfer.
-            self.link.swj_sequence()
-            self.read_id_code()
-        self.clear_sticky_err()
+    def init_sequence(self):
+        """! @brief Init task to connect to the target.
+        
+        Returns a @ref pyocd.utility.sequence.CallSequence CallSequence that will connect to the
+        DP, power up debug and the system, check the DP version to identify whether the target uses
+        ADI v5 or v6, then clears sticky errors.
+        
+        The probe must have already been opened prior to this method being called.
+        
+        @param self
+        """
+        return CallSequence(
+            ('get_probe_capabilities', self._get_probe_capabilities),
+            ('connect',             self._connect),
+            ('clear_sticky_err',    self.clear_sticky_err),
+            ('power_up_debug',      self.power_up_debug),
+            ('check_version',       self._check_version),
+            )
 
-    def read_id_code(self):
-        # Read ID register and get DP version
-        self.dpidr = self.read_reg(DP_IDCODE)
-        self.dp_version = (self.dpidr & DPIDR_VERSION_MASK) >> DPIDR_VERSION_SHIFT
-        self.is_mindp = (self.dpidr & DPIDR_MIN_MASK) != 0
-        logging.info("DP IDR = 0x%08x", self.dpidr)
-        return self.dpidr
+    def _get_probe_capabilities(self):
+        """! @brief Examine the probe's capabilities."""
+        caps = self._probe.capabilities
+        self._probe_managed_ap_select = (DebugProbe.Capability.MANAGED_AP_SELECTION in caps)
+        self._probe_managed_dpbanksel = (DebugProbe.Capability.MANAGED_DPBANKSEL in caps)
+        self._probe_supports_dpbanksel = (DebugProbe.Capability.BANKED_DP_REGISTERS in caps)
+
+    def _connect(self):
+        # Attempt to connect.
+        connector = DPConnector(self.probe)
+        connector.connect(self._protocol)
+
+        # Report on DP version.
+        self.dpidr = connector.idr
+        LOG.info("DP IDR = 0x%08x (v%d%s rev%d)", self.dpidr.idr, self.dpidr.version,
+            " MINDP" if self.dpidr.mindp else "", self.dpidr.revision)
+        
+    def _check_version(self):
+        self._is_dpv3 = (self.dpidr.version == 3)
+        if self._is_dpv3:
+            idr1 = self.read_reg(DP_IDR1)
+            
+            self._addr_size = idr1 & DPIDR1_ASIZE_MASK
+            self._addr_mask = (1 << self._addr_size) - 1
+            self._errmode_supported = (idr1 & DPIDR1_ERRMODE_MASK) != 0
+            
+            LOG.debug("DP IDR1 = 0x%08x (addr size=%d, errmode=%d)", idr1, self._addr_size, self._errmode_supported)
+            
+            # Read base system address.
+            baseptr0 = self.read_reg(DP_BASEPTR0)
+            valid = (baseptr0 & BASEPTR0_VALID_MASK) != 0
+            if valid:
+                base = (baseptr0 & BASEPTR0_PTR_MASK) >> BASEPTR0_PTR_SHIFT
+                if self._addr_size > 32:
+                    baseptr1 = self.read_reg(DP_BASEPTR1)
+                    base |= baseptr1 << 32
+
+                base &= self._addr_mask
+                self._base_addr = base
+                
+                LOG.debug("DP BASEPTR = 0x%08x", self._base_addr)
+            else:
+                LOG.warning("DPv3 has no valid base address")
 
     def flush(self):
         try:
-            self.link.flush()
-        except exceptions.ProbeError as error:
+            self.probe.flush()
+        except exceptions.TargetError as error:
             self._handle_error(error, self.next_access_number)
             raise
 
@@ -122,133 +348,219 @@ class DebugPort(object):
         self.write_dp(addr, data)
 
     def power_up_debug(self):
-        # select bank 0 (to access DRW and TAR)
-        self.write_reg(DP_SELECT, 0)
-        self.write_reg(DP_CTRL_STAT, CSYSPWRUPREQ | CDBGPWRUPREQ)
+        """! @brief Assert DP power requests.
+        
+        Request both debug and system power be enabled, and wait until the request is acked.
+        There is a timeout for the request.
+        
+        @return Boolean indicating whether the power up request succeeded.
+        """
+        # Send power up request for system and debug.
+        self.write_reg(DP_CTRL_STAT, CSYSPWRUPREQ | CDBGPWRUPREQ | MASKLANE | TRNNORMAL)
 
-        while True:
-            r = self.read_reg(DP_CTRL_STAT)
-            if (r & (CDBGPWRUPACK | CSYSPWRUPACK)) == (CDBGPWRUPACK | CSYSPWRUPACK):
-                break
+        with Timeout(DP_POWER_REQUEST_TIMEOUT) as time_out:
+            while time_out.check():
+                r = self.read_reg(DP_CTRL_STAT)
+                if (r & (CDBGPWRUPACK | CSYSPWRUPACK)) == (CDBGPWRUPACK | CSYSPWRUPACK):
+                    break
+            else:
+                return False
 
-        self.write_reg(DP_CTRL_STAT, CSYSPWRUPREQ | CDBGPWRUPREQ | TRNNORMAL | MASKLANE)
-        self.write_reg(DP_SELECT, 0)
+        self.write_reg(DP_CTRL_STAT, CSYSPWRUPREQ | CDBGPWRUPREQ | MASKLANE | TRNNORMAL)
+        
+        return True
 
     def power_down_debug(self):
-        # select bank 0 (to access DRW and TAR)
-        self.write_reg(DP_SELECT, 0)
-        self.write_reg(DP_CTRL_STAT, 0)
+        """! @brief Deassert DP power requests.
+        
+        ADIv6 says that we must not clear CSYSPWRUPREQ and CDBGPWRUPREQ at the same time.
+        ADIv5 says CSYSPWRUPREQ must not be set to 1 while CDBGPWRUPREQ is set to 0. So we
+        start with deasserting system power, then debug power. Each deassertion has its own
+        timeout.
+        
+        @return Boolean indicating whether the power down request succeeded.
+        """
+        # Power down system first.
+        self.write_reg(DP_CTRL_STAT, CDBGPWRUPREQ | MASKLANE | TRNNORMAL)
+        
+        with Timeout(DP_POWER_REQUEST_TIMEOUT) as time_out:
+            while time_out.check():
+                r = self.read_reg(DP_CTRL_STAT)
+                if (r & (CDBGPWRUPACK | CSYSPWRUPACK)) == CDBGPWRUPACK:
+                    break
+            else:
+                return False
+
+        # Now power down debug.
+        self.write_reg(DP_CTRL_STAT,  MASKLANE | TRNNORMAL)
+        
+        with Timeout(DP_POWER_REQUEST_TIMEOUT) as time_out:
+            while time_out.check():
+                r = self.read_reg(DP_CTRL_STAT)
+                if (r & (CDBGPWRUPACK | CSYSPWRUPACK)) == 0:
+                    break
+            else:
+                return False
+        
+        return True
 
     def reset(self):
+        self._cached_dp_select = None
         for ap in self.aps.values():
             ap.reset_did_occur()
-        self.link.reset()
+        self.probe.reset()
 
     def assert_reset(self, asserted):
+        self._cached_dp_select = None
         if asserted:
             for ap in self.aps.values():
                 ap.reset_did_occur()
-        self.link.assert_reset(asserted)
+        self.probe.assert_reset(asserted)
 
     def is_reset_asserted(self):
-        return self.link.is_reset_asserted()
+        return self.probe.is_reset_asserted()
 
     def set_clock(self, frequency):
-        self.link.set_clock(frequency)
-        
-    ## @brief Find valid APs.
-    #
-    # Scans for valid APs starting at APSEL=0 and stopping the first time a 0 is returned
-    # when reading the AP's IDR.
-    #
-    # Note that a few MCUs will lock up when accessing invalid APs. Those MCUs will have to
-    # modify the init call sequence to substitute a fixed list of valid APs. In fact, that
-    # is a major reason this method is separated from create_aps().
-    def find_aps(self):
-        if self.valid_aps is not None:
-            return
-        self.valid_aps = []
-        ap_num = 0
-        while True:
-            try:
-                isValid = AccessPort.probe(self, ap_num)
-                if not isValid:
-                    return
-                self.valid_aps.append(ap_num)
-            except Exception as e:
-                logging.error("Exception while probing AP#%d: %s", ap_num, repr(e))
-                break
-            ap_num += 1
+        self.probe.set_clock(frequency)
 
-    ## @brief Init task that returns a call sequence to create APs.
-    #
-    # For each AP in the #valid_aps list, an AccessPort object is created. The new objects
-    # are added to the #aps dict, keyed by their AP number.
-    def create_aps(self):
-        seq = CallSequence()
-        for ap_num in self.valid_aps:
-            seq.append(
-                ('create_ap.{}'.format(ap_num), lambda ap_num=ap_num: self.create_1_ap(ap_num))
-                )
-        return seq
+    def _write_dp_select(self, mask, value):
+        """! @brief Modify part of the DP SELECT register and write if cache is stale.
+        
+        The DP lock must already be acquired before calling this method.
+        """
+        # Compute the new SELECT value and see if we need to write it.
+        if self._cached_dp_select is None:
+            select = value
+        else:
+            select = (self._cached_dp_select & ~mask) | value
+            if select == self._cached_dp_select:
+                return
+        
+        # Update the SELECT register and cache.
+        self.write_dp(DP_SELECT, select)
+        self._cached_dp_select = select
     
-    ## @brief Init task to create a single AP object.
-    def create_1_ap(self, ap_num):
-        try:
-            ap = AccessPort.create(self, ap_num)
-            logging.info("AP#%d IDR = 0x%08x", ap_num, ap.idr)
-            self.aps[ap_num] = ap
-        except Exception as e:
-            logging.error("Exception reading AP#%d IDR: %s", ap_num, repr(e))
-    
-    ## @brief Init task that generates a call sequence to init all AP ROMs.
-    def init_ap_roms(self):
-        seq = CallSequence()
-        for ap in [x for x in self.aps.values() if x.has_rom_table]:
-            seq.append(
-                ('init_ap.{}'.format(ap.ap_num), ap.init_rom_table)
-                )
-        return seq
+    def _set_dpbanksel(self, addr, is_write):
+        """! @brief Updates the DPBANKSEL field of the SELECT register as required.
+        
+        Several DP registers (most, actually) ignore DPBANKSEL. If one of those is being
+        accessed, any value of DPBANKSEL can be used. Otherwise SELECT is updated if necessary
+        and a lock acquired so another thread doesn't change DPBANKSEL until thsi transaction is
+        complete.
+        
+        This method also handles the case where the debug probe manages DPBANKSEL on its own,
+        such as with STLink.
+        
+        @return Whether the access needs a lock on DP SELECT.
+        @exception exceptions.ProbeError Raised when a banked register is being accessed but the
+            probe doesn't support DPBANKSEL.
+        """
+        # For DPv1-2, only address 0x4 (CTRL/STAT) honours DPBANKSEL.
+        # For DPv3, SELECT and RDBUFF ignore DPBANKSEL for both reads and writes, while
+        # ABORT ignores it only for writes (address 0 for reads is IDR).
+        if self._is_dpv3 and not is_write:
+            registers_ignoring_dpbanksel = (DP_SELECT, DP_RDBUFF)
+        else:
+            registers_ignoring_dpbanksel = (DP_ABORT, DP_SELECT, DP_RDBUFF)
+        
+        if (addr & DPADDR_MASK) not in registers_ignoring_dpbanksel:
+            # Get the DP bank.
+            dpbanksel = (addr & DPADDR_DPBANKSEL_MASK) >> DPADDR_DPBANKSEL_SHIFT
+            
+            # Check if the probe handles this for us.
+            if self._probe_managed_dpbanksel:
+                # If there is a nonzero DPBANKSEL and the probe doesn't support this,
+                # then report an error.
+                if dpbanksel and not self._probe_supports_dpbanksel:
+                    raise exceptions.ProbeError("probe does not support banked DP registers")
+                else:
+                    return False
+            
+            # Update the selected DP bank.
+            self.lock()
+            self._write_dp_select(SELECT_DPBANKSEL_MASK, dpbanksel)
+            return True
+        else:
+            return False
 
     def read_dp(self, addr, now=True):
         num = self.next_access_number
+        
+        # Update DPBANKSEL if required.
+        did_lock = self._set_dpbanksel(addr, False)
 
         try:
-            result_cb = self.link.read_dp(addr, now=False)
-        except exceptions.ProbeError as error:
+            result_cb = self.probe.read_dp(addr & DPADDR_MASK, now=False)
+        except exceptions.TargetError as error:
             self._handle_error(error, num)
+            if did_lock:
+                self.unlock()
+            raise
+        except Exception:
+            if did_lock:
+                self.unlock()
             raise
 
         # Read callback returned for async reads.
         def read_dp_cb():
             try:
                 result = result_cb()
-                if LOG_DAP:
-                    self.logger.info("read_dp:%06d %s(addr=0x%08x) -> 0x%08x", num, "" if now else "...", addr.value, result)
+                TRACE.debug("read_dp:%06d %s(addr=0x%08x) -> 0x%08x", num, "" if now else "...", addr, result)
                 return result
-            except exceptions.ProbeError as error:
+            except exceptions.TargetError as error:
+                TRACE.debug("read_dp:%06d %s(addr=0x%08x) -> error (%s)", num, "" if now else "...", addr, error)
                 self._handle_error(error, num)
                 raise
+            finally:
+                if did_lock:
+                    self.unlock()
 
         if now:
             return read_dp_cb()
         else:
-            if LOG_DAP:
-                self.logger.info("read_dp:%06d (addr=0x%08x) -> ...", num, addr.value)
+            TRACE.debug("read_dp:%06d (addr=0x%08x) -> ...", num, addr)
             return read_dp_cb
 
     def write_dp(self, addr, data):
         num = self.next_access_number
+        
+        # Update DPBANKSEL if required.
+        did_lock = self._set_dpbanksel(addr, True)
 
         # Write the DP register.
         try:
-            if LOG_DAP:
-                self.logger.info("write_dp:%06d (addr=0x%08x) = 0x%08x", num, addr.value, data)
-            self.link.write_dp(addr, data)
-        except exceptions.ProbeError as error:
+            TRACE.debug("write_dp:%06d (addr=0x%08x) = 0x%08x", num, addr, data)
+            self.probe.write_dp(addr & DPADDR_MASK, data)
+        except exceptions.TargetError as error:
             self._handle_error(error, num)
             raise
+        finally:
+            if did_lock:
+                self.unlock()
 
+        return True
+    
+    def _select_ap(self, addr):
+        """! @brief Write DP_SELECT to choose the given AP.
+        
+        Handles the case where the debug probe manages selecting an AP itself, in which case we
+        never write SELECT directly.
+
+        @return Whether the access needs a lock on DP SELECT.
+        """
+        # If the probe handles selecting the AP for us, there's nothing to do here.
+        if self._probe_managed_ap_select:
+            return False
+        
+        # Write DP SELECT to select the probe.
+        self.lock()
+        if self.adi_version == ADIVersion.ADIv5:
+            self._write_dp_select(APSEL_APBANKSEL, addr & APSEL_APBANKSEL)
+        elif self.adi_version == ADIVersion.ADIv6:
+            self._write_dp_select(SELECT_APADDR_MASK, addr & SELECT_APADDR_MASK)
+        else:
+            self.unlock()
+            assert False, "invalid ADI version"
         return True
 
     def write_ap(self, addr, data):
@@ -256,12 +568,15 @@ class DebugPort(object):
         num = self.next_access_number
 
         try:
-            if LOG_DAP:
-                self.logger.info("write_ap:%06d (addr=0x%08x) = 0x%08x", num, addr, data)
-            self.link.write_ap(addr, data)
-        except exceptions.ProbeError as error:
+            did_lock = self._select_ap(addr)
+            TRACE.debug("write_ap:%06d (addr=0x%08x) = 0x%08x", num, addr, data)
+            self.probe.write_ap(addr, data)
+        except exceptions.TargetError as error:
             self._handle_error(error, num)
             raise
+        finally:
+            if did_lock:
+                self.unlock()
 
         return True
 
@@ -270,44 +585,176 @@ class DebugPort(object):
         num = self.next_access_number
 
         try:
-            result_cb = self.link.read_ap(addr, now=False)
-        except exceptions.ProbeError as error:
+            did_lock = self._select_ap(addr)
+            result_cb = self.probe.read_ap(addr, now=False)
+        except exceptions.TargetError as error:
             self._handle_error(error, num)
+            if did_lock:
+                self.unlock()
+            raise
+        except Exception:
+            if did_lock:
+                self.unlock()
             raise
 
         # Read callback returned for async reads.
         def read_ap_cb():
             try:
                 result = result_cb()
-                if LOG_DAP:
-                    self.logger.info("read_ap:%06d %s(addr=0x%08x) -> 0x%08x", num, "" if now else "...", addr, result)
+                TRACE.debug("read_ap:%06d %s(addr=0x%08x) -> 0x%08x", num, "" if now else "...", addr, result)
                 return result
-            except exceptions.ProbeError as error:
+            except exceptions.TargetError as error:
+                TRACE.debug("read_ap:%06d %s(addr=0x%08x) -> error (%s)", num, "" if now else "...", addr, error)
                 self._handle_error(error, num)
                 raise
+            finally:
+                if did_lock:
+                    self.unlock()
 
         if now:
             return read_ap_cb()
         else:
-            if LOG_DAP:
-                self.logger.info("read_ap:%06d (addr=0x%08x) -> ...", num, addr)
+            TRACE.debug("read_ap:%06d (addr=0x%08x) -> ...", num, addr)
             return read_ap_cb
 
+    def write_ap_multiple(self, addr, values):
+        assert type(addr) in (six.integer_types)
+        num = self.next_access_number
+        
+        try:
+            did_lock = self._select_ap(addr)
+            TRACE.debug("write_ap_multiple:%06d (addr=0x%08x) = (%i values)", num, addr, len(values))
+            return self.probe.write_ap_multiple(addr, values)
+        except exceptions.TargetError as error:
+            self._handle_error(error, num)
+            raise
+        finally:
+            if did_lock:
+                self.unlock()
+
+    def read_ap_multiple(self, addr, count=1, now=True):
+        assert type(addr) in (six.integer_types)
+        num = self.next_access_number
+        
+        try:
+            did_lock = self._select_ap(addr)
+            TRACE.debug("read_ap_multiple:%06d (addr=0x%08x, count=%i)", num, addr, count)
+            result_cb = self.probe.read_ap_multiple(addr, count, now=False)
+        except exceptions.TargetError as error:
+            self._handle_error(error, num)
+            raise
+        except Exception:
+            if did_lock:
+                self.unlock()
+            raise
+
+        # Need to wrap the deferred callback to convert exceptions.
+        def read_ap_multiple_cb():
+            try:
+                return result_cb()
+            except exceptions.TargetError as error:
+                TRACE.debug("read_ap_multiple:%06d %s(addr=0x%08x) -> error (%s)", num, "" if now else "...", addr, error)
+                self._handle_error(error, num)
+                raise
+            finally:
+                if did_lock:
+                    self.unlock()
+
+        if now:
+            return read_ap_multiple_cb()
+        else:
+            return read_ap_multiple_cb
+
     def _handle_error(self, error, num):
-        if LOG_DAP:
-            self.logger.info("error:%06d %s", num, error)
-        # Clear sticky error for Fault errors only
+        TRACE.debug("error:%06d %s", num, error)
+        # Clear sticky error for fault errors.
         if isinstance(error, exceptions.TransferFaultError):
             self.clear_sticky_err()
+        # For timeouts caused by WAIT responses, set DAPABORT to abort the transfer.
+        elif isinstance(error, exceptions.TransferTimeoutError):
+            # This may put the AP that was aborted into an unpredictable state. Should consider
+            # attempting to reset debug logic.
+            self.write_reg(DP_ABORT, ABORT_DAPABORT)
 
     def clear_sticky_err(self):
-        mode = self.link.wire_protocol
+        self._cached_dp_select = None
+        mode = self.probe.wire_protocol
         if mode == DebugProbe.Protocol.SWD:
-            self.write_reg(DP_ABORT, ABORT_STKERRCLR)
+            self.write_reg(DP_ABORT, ABORT_ORUNERRCLR | ABORT_WDERRCLR | ABORT_STKERRCLR | ABORT_STKCMPCLR)
         elif mode == DebugProbe.Protocol.JTAG:
-            self.write_reg(DP_CTRL_STAT, CTRLSTAT_STICKYERR)
+            self.write_reg(DP_CTRL_STAT, CSYSPWRUPREQ | CDBGPWRUPREQ | TRNNORMAL | MASKLANE
+                    | CTRLSTAT_STICKYERR | CTRLSTAT_STICKYCMP | CTRLSTAT_STICKYORUN)
         else:
             assert False
 
+class APAccessMemoryInterface(memory_interface.MemoryInterface):
+    """! @brief Memory interface for performing simple APACC transactions.
+    
+    This class allows the caller to generate Debug APB transactions from a DPv3. It simply
+    adapts the MemoryInterface to APACC transactions.
+    
+    By default, it passes memory transaction addresses unmodified to the DP. But an instance can be
+    constructed by passing an APAddress object to the constructor that offsets transaction addresses
+    so they are relative to the APAddress base.
+    
+    Only 32-bit transfers are supported.
+    """
+    
+    def __init__(self, dp, ap_address=None):
+        """! @brief Constructor.
+        
+        @param self
+        @param dp The DebugPort object.
+        @param ap_address Optional instance of APAddress. If provided, all memory transaction
+            addresses are offset by the base address of the APAddress.
+        """
+        self._dp = dp
+        self._ap_address = ap_address
+        if ap_address is not None:
+            self._offset = ap_address.address
+        else:
+            self._offset = 0
+    
+    @property
+    def dp(self):
+        return self._dp
+    
+    @property
+    def short_description(self):
+        if self._ap_address is None:
+            return "Root Component"
+        else:
+            return "Root Component ({})".format(self._ap_address)
 
+    def write_memory(self, addr, data, transfer_size=32):
+        """! @brief Write a single memory location.
+        
+        By default the transfer size is a word."""
+        if transfer_size != 32:
+            raise exceptions.DebugError("unsupported transfer size")
+        
+        return self._dp.write_ap(self._offset + addr, data)
+        
+    def read_memory(self, addr, transfer_size=32, now=True):
+        """! @brief Read a memory location.
+        
+        By default, a word will be read."""
+        if transfer_size != 32:
+            raise exceptions.DebugError("unsupported transfer size")
+        
+        return self._dp.read_ap(self._offset + addr, now)
+
+    def write_memory_block32(self, addr, data):
+        """! @brief Write an aligned block of 32-bit words."""
+        addr += self._offset
+        for word in data:
+            self._dp.write_ap(addr, data)
+            addr += 4
+
+    def read_memory_block32(self, addr, size):
+        """! @brief Read an aligned block of 32-bit words."""
+        addr += self._offset
+        result_cbs = [self._dp.read_ap(addr + i * 4, now=False) for i in range(size)]
+        result = [cb() for cb in result_cbs]
+        return result
 

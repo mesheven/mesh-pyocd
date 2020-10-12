@@ -1,19 +1,18 @@
-"""
- mbed CMSIS-DAP debugger
- Copyright (c) 2015-2015 ARM Limited
-
- Licensed under the Apache License, Version 2.0 (the "License");
- you may not use this file except in compliance with the License.
- You may obtain a copy of the License at
-
-     http://www.apache.org/licenses/LICENSE-2.0
-
- Unless required by applicable law or agreed to in writing, software
- distributed under the License is distributed on an "AS IS" BASIS,
- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- See the License for the specific language governing permissions and
- limitations under the License.
-"""
+# pyOCD debugger
+# Copyright (c) 2015-2020 Arm Limited
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from __future__ import print_function
 
 import logging
@@ -22,15 +21,122 @@ import sys
 import traceback
 from xml.etree import ElementTree
 import six
+import subprocess
+import tempfile
+import threading
+from pyocd.utility.compatibility import to_str_safe
 
 isPy2 = (sys.version_info[0] == 2)
+
+OBJCOPY = "arm-none-eabi-objcopy"
+
+TEST_DIR = os.path.dirname(os.path.abspath(__file__))
+PYOCD_DIR = os.path.dirname(TEST_DIR)
+TEST_DATA_DIR = os.path.join(TEST_DIR, "data")
+TEST_OUTPUT_DIR = os.path.join(TEST_DIR, "output")
+
+def get_test_binary_path(binary_name):
+    return os.path.join(TEST_DATA_DIR, "binaries", binary_name)
+
+def get_env_name():
+    return os.environ.get('TOX_ENV_NAME', '')
+
+def get_env_file_name():
+    env_name = get_env_name()
+    return ("_" + env_name) if env_name else ''
+
+def ensure_output_dir():
+    if not os.path.isdir(TEST_OUTPUT_DIR):
+        if os.path.exists(TEST_OUTPUT_DIR):
+            raise RuntimeError("path '%s' already exists but is not a directory" % TEST_OUTPUT_DIR)
+        os.mkdir(TEST_OUTPUT_DIR)
 
 # Returns common option values passed in when creating test sessions.
 def get_session_options():
     return {
-        'config_file' : 'test_boards.yaml',
-        'frequency' : 1000000, # 1 MHz
+        # These options can be overridden by probe config in pyocd.yaml.
+        'option_defaults': {
+            'frequency': 1000000, # 1 MHz
+            'skip_test': False,
+            },
         }
+
+# Returns a dict containing some test parameters for the target in the passed-in session.
+#
+# 'test_clock' : the max supported SWD frequency for the target
+# 'error_on_invalid_access' : whether invalid accesses cause a fault
+#
+def get_target_test_params(session):
+    target_type = session.board.target_type
+    error_on_invalid_access = True
+    if target_type in ("nrf51", "nrf52", "nrf52840"):
+        # Override clock since 10MHz is too fast
+        test_clock = 1000000
+        error_on_invalid_access = False
+    elif target_type == "ncs36510":
+        # Override clock since 10MHz is too fast
+        test_clock = 1000000
+    else:
+        # Default of 10 MHz. Most probes will not actually run this fast, but this
+        # sets them to their max supported frequency.
+        test_clock = 10000000
+    return {
+            'test_clock': test_clock,
+            'error_on_invalid_access': error_on_invalid_access,
+            }
+
+# Generate an Intel hex file from the binary test file.
+def binary_to_hex_file(binary_file, base_address):
+    temp_test_hex_name = tempfile.mktemp('.hex')
+    objcopyOutput = subprocess.check_output([OBJCOPY,
+        "-v", "-I", "binary", "-O", "ihex", "-B", "arm", "-S",
+        "--set-start", "0x%x" % base_address,
+        "--change-addresses", "0x%x" % base_address,
+        binary_file, temp_test_hex_name], stderr=subprocess.STDOUT)
+    print(to_str_safe(objcopyOutput))
+    # Need to escape backslashes on Windows.
+    if sys.platform.startswith('win'):
+        temp_test_hex_name = temp_test_hex_name.replace('\\', '\\\\')
+    return temp_test_hex_name
+
+# Generate an elf from the binary test file.
+def binary_to_elf_file(binary_file, base_address):
+    temp_test_elf_name = tempfile.mktemp('.elf')
+    objcopyOutput = subprocess.check_output([OBJCOPY,
+        "-v", "-I", "binary", "-O", "elf32-littlearm", "-B", "arm", "-S",
+        "--set-start", "0x%x" % base_address,
+        "--change-addresses", "0x%x" % base_address,
+        binary_file, temp_test_elf_name], stderr=subprocess.STDOUT)
+    print(to_str_safe(objcopyOutput))
+    # Need to escape backslashes on Windows.
+    if sys.platform.startswith('win'):
+        temp_test_elf_name = temp_test_elf_name.replace('\\', '\\\\')
+    return temp_test_elf_name
+
+def run_in_parallel(function, args_list):
+    """Create and run a thread in parallel for each element in args_list
+
+    Wait until all threads finish executing. Throw an exception if an exception
+    occurred on any of the threads.
+    """
+    def _thread_helper(idx, func, args):
+        """Run the function and set result to True if there was not error"""
+        func(*args)
+        result_list[idx] = True
+
+    result_list = [False] * len(args_list)
+    thread_list = []
+    for idx, args in enumerate(args_list):
+        thread = threading.Thread(target=_thread_helper,
+                                  args=(idx, function, args))
+        thread.start()
+        thread_list.append(thread)
+
+    for thread in thread_list:
+        thread.join()
+    for result in result_list:
+        if result is not True:
+            raise Exception("Running in thread failed")
 
 class IOTee(object):
     def __init__(self, *args):
@@ -84,9 +190,13 @@ class TestResult(object):
         self.board_name = newBoard.name
 
     def get_test_case(self):
+        if 'TOX_ENV_NAME' in os.environ:
+            classname = "{}.{}.{}.{}".format(os.environ['TOX_ENV_NAME'], self.board_name, self.board, self.name)
+        else:
+            classname = "{}.{}.{}".format(self.board_name, self.board, self.name)
         case = ElementTree.Element('testcase',
                     name=self.name,
-                    classname="{}.{}.{}".format(self.board_name, self.board, self.name),
+                    classname=classname,
                     status=("passed" if self.passed else "failed"),
                     time="%.3f" % self.time
                     )

@@ -1,20 +1,19 @@
 #!/usr/bin/env python
-"""
- mbed CMSIS-DAP debugger
- Copyright (c) 2006-2018 ARM Limited
-
- Licensed under the Apache License, Version 2.0 (the "License");
- you may not use this file except in compliance with the License.
- You may obtain a copy of the License at
-
-     http://www.apache.org/licenses/LICENSE-2.0
-
- Unless required by applicable law or agreed to in writing, software
- distributed under the License is distributed on an "AS IS" BASIS,
- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- See the License for the specific language governing permissions and
- limitations under the License.
-"""
+# pyOCD debugger
+# Copyright (c) 2006-2018 Arm Limited
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 from __future__ import print_function
 import argparse
@@ -37,7 +36,10 @@ from ..probe.pydapaccess import DAPAccess
 from ..utility.progress import print_progress
 from ..utility.cmdline import convert_session_options
 from ..debug.elf.elf import (ELFBinaryFile, SH_FLAGS)
-from ..flash.loader import (FileProgrammer, FlashEraser)
+from ..flash.file_programmer import FileProgrammer
+from ..flash.eraser import FlashEraser
+
+LOG = logging.getLogger(__name__)
 
 LEVELS = {
     'debug': logging.DEBUG,
@@ -51,8 +53,6 @@ LEVELS = {
 board = None
 
 supported_formats = ['bin', 'hex', 'elf']
-supported_targets = list(target.TARGET.keys())
-supported_targets.remove('cortex_m')  # No generic programming
 
 DEBUG_LEVELS = list(LEVELS.keys())
 
@@ -75,7 +75,8 @@ parser.add_argument('--version', action='version', version=__version__)
 # reserved: "-p", "--port"
 # reserved: "-c", "--cmd-port"
 parser.add_argument('--config', metavar="PATH", default=None, help="Use a YAML config file.")
-parser.add_argument("--no-config", action="store_true", help="Do not use a configuration file.")
+parser.add_argument("--no-config", action="store_true", default=None, help="Do not use a configuration file.")
+parser.add_argument("--pack", metavar="PATH", help="Path to a CMSIS Device Family Pack")
 parser.add_argument("-b", "--board", dest="board_id", default=None,
                     help="Connect to board by board ID. Use -l to list all connected boards. Only a unique part of the board ID needs to be provided.")
 parser.add_argument("-l", "--list", action="store_true", dest="list_all", default=False,
@@ -83,13 +84,13 @@ parser.add_argument("-l", "--list", action="store_true", dest="list_all", defaul
 parser.add_argument("-d", "--debug", dest="debug_level", choices=DEBUG_LEVELS, default='info',
                     help="Set the level of system logging output. Supported choices are: " + ", ".join(DEBUG_LEVELS),
                     metavar="LEVEL")
-parser.add_argument("-t", "--target", dest="target_override", choices=supported_targets, default=None,
-                    help="Override target to debug.  Supported targets are: " + ", ".join(supported_targets),
+parser.add_argument("-t", "--target", dest="target_override", default=None,
+                    help="Override target to debug.",
                     metavar="TARGET")
 # reserved: "-n", "--nobreak"
 # reserved: "-r", "--reset-break"
 # reserved: "-s", "--step-int"
-parser.add_argument("-f", "--frequency", dest="frequency", default=1000000, type=int,
+parser.add_argument("-f", "--frequency", dest="frequency", default=None, type=int,
                     help="Set the SWD clock frequency in Hz.")
 # reserved: "-o", "--persist"
 # reserved: "-k", "--soft-bkpt-as-hard"
@@ -103,8 +104,8 @@ parser.add_argument("-n", "--count", default=1, type=int_base_0,
                     help="Number of sectors to erase. Only applies to sector erase. Default is 1.")
 parser.add_argument("-s", "--skip", default=0, type=int_base_0,
                     help="Skip programming the first N bytes.  This can only be used with binary files")
-parser.add_argument("-hp", "--hide_progress", action="store_true", help="Don't display programming progress.")
-parser.add_argument("-fp", "--fast_program", action="store_true",
+parser.add_argument("-hp", "--hide_progress", action="store_true", default=None, help="Don't display programming progress.")
+parser.add_argument("-fp", "--fast_program", action="store_true", default=None,
                     help="Use only the CRC of each page to determine if it already has the same data.")
 parser.add_argument("-da", "--daparg", dest="daparg", nargs='+', help="Send setting to DAPAccess layer.")
 parser.add_argument("--mass-erase", action="store_true", help="Mass erase the target device.")
@@ -133,7 +134,7 @@ def main():
     DAPAccess.set_args(args.daparg)
 
     if not args.no_deprecation_warning:
-        logging.warning("pyocd-flashtool is deprecated; please use the new combined pyocd tool.")
+        LOG.warning("pyocd-flashtool is deprecated; please use the new combined pyocd tool.")
         
     # Sanity checks before attaching to board
     if args.format == 'hex' and not intelhex_available:
@@ -147,7 +148,8 @@ def main():
         session = ConnectHelper.session_with_chosen_probe(
                             config_file=args.config,
                             no_config=args.no_config,
-                            board_id=args.board_id,
+                            pack=args.pack,
+                            unique_id=args.board_id,
                             target_override=args.target_override,
                             frequency=args.frequency,
                             blocking=False,
@@ -193,7 +195,7 @@ def main():
                                 print("Warning: sector address 0x%08x is unaligned" % page_addr)
                                 page_addr -= delta
                         print("Erasing sector 0x%08x" % page_addr)
-                        flash.erase_page(page_addr)
+                        flash.erase_sector(page_addr)
                         page_addr += page_info.size
 
                     flash.cleanup()
@@ -203,16 +205,16 @@ def main():
 
             # Convert arguments for FileProgrammer.
             if args.chip_erase:
-                chip_erase = True
+                chip_erase = "chip"
             elif args.sector_erase:
-                chip_erase = False
+                chip_erase = "sector"
             else:
-                chip_erase = None
+                chip_erase = "auto"
             
             # Program the file into flash.
             programmer = FileProgrammer(session, chip_erase=chip_erase, trust_crc=args.fast_program)
             programmer.program(args.file,
-                                format=args.format,
+                                file_format=args.format,
                                 base_address=args.address,
                                 skip=args.skip)
 

@@ -1,26 +1,26 @@
-"""
- mbed CMSIS-DAP debugger
- Copyright (c) 2016 ARM Limited
-
- Licensed under the Apache License, Version 2.0 (the "License");
- you may not use this file except in compliance with the License.
- You may obtain a copy of the License at
-
-     http://www.apache.org/licenses/LICENSE-2.0
-
- Unless required by applicable law or agreed to in writing, software
- distributed under the License is distributed on an "AS IS" BASIS,
- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- See the License for the specific language governing permissions and
- limitations under the License.
-"""
+# pyOCD debugger
+# Copyright (c) 2016-2020 Arm Limited
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 from .provider import (TargetThread, ThreadProvider)
-from .common import (read_c_string, HandlerModeThread)
+from .common import (read_c_string, HandlerModeThread, EXC_RETURN_EXT_FRAME_MASK)
 from ..core import exceptions
 from ..core.target import Target
+from ..core.plugin import Plugin
 from ..debug.context import DebugContext
-from ..coresight.cortex_m import (CORE_REGISTER, register_name_to_index)
+from ..coresight.cortex_m_core_registers import index_for_reg
 import logging
 
 FREERTOS_MAX_PRIORITIES	= 63
@@ -35,7 +35,7 @@ THREAD_PRIORITY_OFFSET = 44
 THREAD_NAME_OFFSET = 52
 
 # Create a logger for this module.
-log = logging.getLogger("freertos")
+LOG = logging.getLogger(__name__)
 
 class TargetList(object):
     def __init__(self, context, ptr):
@@ -62,11 +62,12 @@ class TargetList(object):
                 prev = node
                 node = self._context.read32(node + LIST_NODE_NEXT_OFFSET)
             except exceptions.TransferError:
-                log.warning("TransferError while reading list elements (list=0x%08x, node=0x%08x), terminating list", self._list, node)
+                LOG.warning("TransferError while reading list elements (list=0x%08x, node=0x%08x), terminating list", self._list, node)
                 node = 0
 
-## @brief
 class FreeRTOSThreadContext(DebugContext):
+    """! @brief Thread context for FreeRTOS."""
+    
     # SP/PSP are handled specially, so it is not in these dicts.
 
     COMMON_REGISTER_OFFSETS = {
@@ -152,14 +153,13 @@ class FreeRTOSThreadContext(DebugContext):
             }
     FPU_EXTENDED_REGISTER_OFFSETS.update(COMMON_REGISTER_OFFSETS)
 
-    def __init__(self, parentContext, thread):
-        super(FreeRTOSThreadContext, self).__init__(parentContext.core)
-        self._parent = parentContext
+    def __init__(self, parent, thread):
+        super(FreeRTOSThreadContext, self).__init__(parent)
         self._thread = thread
-        self._has_fpu = parentContext.core.has_fpu
+        self._has_fpu = self.core.has_fpu
 
     def read_core_registers_raw(self, reg_list):
-        reg_list = [register_name_to_index(reg) for reg in reg_list]
+        reg_list = [index_for_reg(reg) for reg in reg_list]
         reg_vals = []
 
         isCurrent = self._thread.is_current
@@ -185,7 +185,7 @@ class FreeRTOSThreadContext(DebugContext):
         table = self.NOFPU_REGISTER_OFFSETS
         if self._has_fpu:
             try:
-                if inException and self._parent.core.is_vector_catch():
+                if inException and self.core.is_vector_catch():
                     # Vector catch has just occurred, take live LR
                     exceptionLR = self._parent.read_core_register('lr')
                 else:
@@ -194,7 +194,7 @@ class FreeRTOSThreadContext(DebugContext):
                     exceptionLR = self._parent.read32(sp + offset)
 
                 # Check bit 4 of the saved exception LR to determine if FPU registers were stacked.
-                if (exceptionLR & (1 << 4)) != 0:
+                if (exceptionLR & EXC_RETURN_EXT_FRAME_MASK) != 0:
                     table = self.FPU_BASIC_REGISTER_OFFSETS
                     swStacked = 0x24
                 else:
@@ -202,7 +202,7 @@ class FreeRTOSThreadContext(DebugContext):
                     hwStacked = 0x68
                     swStacked = 0x64
             except exceptions.TransferError:
-                log.debug("Transfer error while reading thread's saved LR")
+                LOG.debug("Transfer error while reading thread's saved LR")
 
         for reg in reg_list:
             # Must handle stack pointer specially.
@@ -232,11 +232,9 @@ class FreeRTOSThreadContext(DebugContext):
 
         return reg_vals
 
-    def write_core_registers_raw(self, reg_list, data_list):
-        self._parent.write_core_registers_raw(reg_list, data_list)
-
-## @brief A FreeRTOS task.
 class FreeRTOSThread(TargetThread):
+    """! @brief A FreeRTOS task."""
+
     RUNNING = 1
     READY = 2
     BLOCKED = 3
@@ -270,7 +268,7 @@ class FreeRTOSThread(TargetThread):
         try:
             return self._target_context.read32(self._base + THREAD_STACK_POINTER_OFFSET)
         except exceptions.TransferError:
-            log.debug("Transfer error while reading thread's stack pointer @ 0x%08x", self._base + THREAD_STACK_POINTER_OFFSET)
+            LOG.debug("Transfer error while reading thread's stack pointer @ 0x%08x", self._base + THREAD_STACK_POINTER_OFFSET)
             return 0
 
     @property
@@ -311,8 +309,8 @@ class FreeRTOSThread(TargetThread):
     def __repr__(self):
         return str(self)
 
-## @brief Thread provider for FreeRTOS.
 class FreeRTOSThreadProvider(ThreadProvider):
+    """! @brief Thread provider for FreeRTOS."""
 
     ## Required FreeRTOS symbols.
     FREERTOS_SYMBOLS = [
@@ -352,28 +350,32 @@ class FreeRTOSThreadProvider(ThreadProvider):
         vPortEnableVFP = self._lookup_symbols(["vPortEnableVFP"], symbolProvider)
         self._fpu_port = vPortEnableVFP is not None
 
+        elfOptHelp = " Try using the --elf option." if self._target.elf is None else ""
+
         # Check for the expected list size. These two symbols are each a single list and xDelayedTaskList2
         # immediately follows xDelayedTaskList1, so we can just subtract their addresses to get the
         # size of a single list.
         delta = self._symbols['xDelayedTaskList2'] - self._symbols['xDelayedTaskList1']
+        delta = self._get_elf_symbol_size('xDelayedTaskList1', self._symbols['xDelayedTaskList1'], delta)
         if delta != LIST_SIZE:
-            log.warning("FreeRTOS: list size is unexpected, maybe an unsupported configuration of FreeRTOS")
+            LOG.warning("FreeRTOS: list size is unexpected, maybe an unsupported configuration of FreeRTOS." + elfOptHelp)
             return False
 
         # xDelayedTaskList1 immediately follows pxReadyTasksLists, so subtracting their addresses gives
-        # us the total size of the pxReadyTaskLists array.
+        # us the total size of the pxReadyTaskLists array. But not trustworthy. Compiler can rearrange things
         delta = self._symbols['xDelayedTaskList1'] - self._symbols['pxReadyTasksLists']
+        delta = self._get_elf_symbol_size('pxReadyTasksLists', self._symbols['pxReadyTasksLists'], delta);
         if delta % LIST_SIZE:
-            log.warning("FreeRTOS: pxReadyTasksLists size is unexpected, maybe an unsupported version of FreeRTOS")
+            LOG.warning("FreeRTOS: pxReadyTasksLists size is unexpected, maybe an unsupported version of FreeRTOS." + elfOptHelp)
             return False
         self._total_priorities = delta // LIST_SIZE
         if self._total_priorities > FREERTOS_MAX_PRIORITIES:
-            log.warning("FreeRTOS: number of priorities is too large (%d)", self._total_priorities)
+            LOG.warning("FreeRTOS: number of priorities is too large (%d)." + elfOptHelp, self._total_priorities)
             return False
-        log.debug("FreeRTOS: number of priorities is %d", self._total_priorities)
+        LOG.debug("FreeRTOS: number of priorities is %d", self._total_priorities)
 
-        self._target.root_target.subscribe(Target.EVENT_POST_FLASH_PROGRAM, self.event_handler)
-        self._target.subscribe(Target.EVENT_POST_RESET, self.event_handler)
+        self._target.session.subscribe(self.event_handler, Target.Event.POST_FLASH_PROGRAM)
+        self._target.session.subscribe(self.event_handler, Target.Event.POST_RESET)
 
         return True
 
@@ -382,7 +384,7 @@ class FreeRTOSThreadProvider(ThreadProvider):
 
     def event_handler(self, notification):
         # Invalidate threads list if flash is reprogrammed.
-        log.debug("FreeRTOS: invalidating threads list: %s" % (repr(notification)))
+        LOG.debug("FreeRTOS: invalidating threads list: %s" % (repr(notification)))
         self.invalidate();
 
     def _build_thread_list(self):
@@ -397,7 +399,7 @@ class FreeRTOSThreadProvider(ThreadProvider):
         # We should only be building the thread list if the scheduler is running, so a zero thread
         # count or a null current thread means something is bizarrely wrong.
         if threadCount == 0 or currentThread == 0:
-            log.warning("FreeRTOS: no threads even though the scheduler is running")
+            LOG.warning("FreeRTOS: no threads even though the scheduler is running")
             return
 
         # Read the top ready priority.
@@ -407,8 +409,8 @@ class FreeRTOSThreadProvider(ThreadProvider):
         # caused by the configUSE_PORT_OPTIMISED_TASK_SELECTION option being enabled, which treats
         # uxTopReadyPriority as a bitmap instead of integer. This is ok because uxTopReadyPriority
         # in optimised mode will always be >= the actual top priority.
-        if topPriority > self._total_priorities:
-            topPriority = self._total_priorities
+        if topPriority >= self._total_priorities:
+            topPriority = self._total_priorities - 1
 
         # Build up list of all the thread lists we need to scan.
         listsToRead = []
@@ -442,17 +444,17 @@ class FreeRTOSThreadProvider(ThreadProvider):
                     else:
                         t.state = state
 
-                    log.debug("Thread 0x%08x (%s)", threadBase, t.name)
+                    LOG.debug("Thread 0x%08x (%s)", threadBase, t.name)
                     newThreads[t.unique_id] = t
                 except exceptions.TransferError:
-                    log.debug("TransferError while examining thread 0x%08x", threadBase)
+                    LOG.debug("TransferError while examining thread 0x%08x", threadBase)
 
         if len(newThreads) != threadCount:
-            log.warning("FreeRTOS: thread count mismatch")
+            LOG.warning("FreeRTOS: thread count mismatch")
 
         # Create fake handler mode thread.
         if self._target_context.read_core_register('ipsr') > 0:
-            log.debug("FreeRTOS: creating handler mode thread")
+            LOG.debug("FreeRTOS: creating handler mode thread")
             t = HandlerModeThread(self._target_context, self)
             newThreads[t.unique_id] = t
 
@@ -508,4 +510,39 @@ class FreeRTOSThreadProvider(ThreadProvider):
             return False
         return self._target_context.read32(self._symbols['xSchedulerRunning']) != 0
 
+    def _get_elf_symbol_size(self, name, addr, calculated_size):
+        if self._target.elf is not None:
+            symInfo = None
+            try:
+                symInfo = self._target.elf.symbol_decoder.get_symbol_for_name(name)
+            except RuntimeError as e:
+                LOG.error("FreeRTOS elf symbol query failed for (%s) with an exception. " + str(e),
+                    name, exc_info=self._target.session.log_tracebacks)
 
+            # Simple checks to make sure gdb is looking at the same executable we are
+            if symInfo is None:
+                LOG.debug("FreeRTOS symbol '%s' not found in elf file", name)
+            elif symInfo.address != addr:
+                LOG.debug("FreeRTOS symbol '%s' address mismatch elf=0x%08x, gdb=0x%08x", name, symInfo.address, addr)
+            else:
+                if calculated_size != symInfo.size:
+                    LOG.info("FreeRTOS symbol '%s' size from elf (%ld) != calculated size (%ld). Using elf value.",
+                        name, symInfo.size, calculated_size)
+                else:
+                    LOG.debug("FreeRTOS symbol '%s' size (%ld) from elf file matches calculated value", name, calculated_size)
+                return symInfo.size
+        return calculated_size
+
+class FreeRTOSPlugin(Plugin):
+    """! @brief Plugin class for FreeRTOS."""
+    
+    def load(self):
+        return FreeRTOSThreadProvider
+    
+    @property
+    def name(self):
+        return "freertos"
+    
+    @property
+    def description(self):
+        return "FreeRTOS"
