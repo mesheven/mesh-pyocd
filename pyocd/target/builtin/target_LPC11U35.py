@@ -15,9 +15,10 @@
  limitations under the License.
 """
 
-from ..flash.flash import Flash
-from ..core.coresight_target import (SVDFile, CoreSightTarget)
-from ..core.memory_map import (FlashRegion, RamRegion, MemoryMap)
+from ...flash.flash import Flash
+from ...coresight.coresight_target import CoreSightTarget
+from ...core.memory_map import (FlashRegion, RamRegion, MemoryMap)
+from ...debug.svd.loader import SVDFile
 import logging
 
 
@@ -51,7 +52,9 @@ FLASH_ALGO = { 'load_address' : 0x10000000,
 
 class LPC11U35(CoreSightTarget):
 
-    memoryMap = MemoryMap(
+    VENDOR = "NXP"
+    
+    MEMORY_MAP = MemoryMap(
         FlashRegion(    start=0x00000000,  length=0x00010000,      blocksize=0x1000, is_boot_memory=True,
             algo=FLASH_ALGO),
         RamRegion(name='sram1',   start=0x10000000, length=0x2000),
@@ -59,8 +62,8 @@ class LPC11U35(CoreSightTarget):
         )
 
     def __init__(self, link):
-        super(LPC11U35, self).__init__(link, self.memoryMap)
-        self._svd_location = SVDFile(vendor="NXP", filename="LPC11U35.svd", is_local=False)
+        super(LPC11U35, self).__init__(link, self.MEMORY_MAP)
+        self._svd_location = SVDFile.from_builtin("LPC11Uxx_v7.svd")
 
     def reset_stop_on_reset(self, software_reset=None, map_to_user=True):
         super(LPC11U35, self).reset_stop_on_reset(software_reset)

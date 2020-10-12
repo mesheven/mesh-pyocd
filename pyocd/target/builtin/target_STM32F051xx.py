@@ -15,9 +15,10 @@
  limitations under the License.
 """
 
-from ..flash.flash import Flash
-from ..core.coresight_target import (SVDFile, CoreSightTarget)
-from ..core.memory_map import (FlashRegion, RamRegion, MemoryMap)
+from ...flash.flash import Flash
+from ...coresight.coresight_target import CoreSightTarget
+from ...core.memory_map import (FlashRegion, RamRegion, MemoryMap)
+from ...debug.svd.loader import SVDFile
 import logging
 
 #DBGMCU clock
@@ -69,29 +70,23 @@ FLASH_ALGO = { 'load_address' : 0x20000000,
 
 class STM32F051T8(CoreSightTarget):
 
-    memoryMap = MemoryMap(
-        FlashRegion(    start=0x08000000,  length=0x10000,      blocksize=0x400, is_boot_memory=True,
-            algo=FLASH_ALGO),
+    VENDOR = "STMicroelectronics"
+    
+    MEMORY_MAP = MemoryMap(
+        FlashRegion(    start=0x08000000,  length=0x10000,      blocksize=0x400, 
+                                                                is_boot_memory=True,
+                                                                algo=FLASH_ALGO),
         RamRegion(      start=0x20000000,  length=0x2000)
         )
 
     def __init__(self, link):
-        super(STM32F051T8, self).__init__(link, self.memoryMap)
-        self._svd_location = SVDFile(vendor="STMicro", filename="STM32F0xx.svd", is_local=False)
-
-    def create_init_sequence(self):
-        seq = super(STM32F051T8, self).create_init_sequence()
-
-        seq.insert_after('create_cores',
-            ('setup_dbgmcu', self.setup_dbgmcu)
-            )
-
-        return seq
-        
-    def setup_dbgmcu(self):
+        super(STM32F051T8, self).__init__(link, self.MEMORY_MAP)
+        self._svd_location = SVDFile.from_builtin("STM32F0x1.svd")
+       
+    def post_connect_hook(self):
         logging.debug('stm32f051t8 init')
-        enclock = self.read_memory(RCC_APB2ENR_CR)
+        enclock = self.read32(RCC_APB2ENR_CR)
         enclock |= RCC_APB2ENR_DBGMCU
-        self.write_memory(RCC_APB2ENR_CR, enclock)
-        self.write_memory(DBGMCU_APB1_CR, DBGMCU_APB1_VAL)
-        self.write_memory(DBGMCU_APB2_CR, DBGMCU_APB2_VAL)
+        self.write32(RCC_APB2ENR_CR, enclock)
+        self.write32(DBGMCU_APB1_CR, DBGMCU_APB1_VAL)
+        self.write32(DBGMCU_APB2_CR, DBGMCU_APB2_VAL)

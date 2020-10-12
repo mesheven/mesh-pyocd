@@ -15,9 +15,10 @@
  limitations under the License.
 """
 
-from ..flash.flash import Flash
-from ..core.coresight_target import (SVDFile, CoreSightTarget)
-from ..core.memory_map import (FlashRegion, RamRegion, MemoryMap)
+from ...flash.flash import Flash
+from ...coresight.coresight_target import CoreSightTarget
+from ...core.memory_map import (FlashRegion, RamRegion, MemoryMap)
+from ...debug.svd.loader import SVDFile
 import logging
 
 #DBGMCU clock
@@ -27,9 +28,6 @@ RCC_APB2ENR_DBGMCU = 0x00400000
 DBGMCU_CR      = 0x40015804
 DBGMCU_APB1_CR = 0x40015808
 DBGMCU_APB2_CR = 0x4001580C
-
-#0000 0000 0000 0000 0000 0000 0000 0100
-#BGMCU_CR_VAL = 0x00000000
 
 #0000 0010 0010 0000 0001 1101 0011 0011
 DBGMCU_APB1_VAL = 0x02201D33
@@ -51,7 +49,7 @@ FLASH_ALGO = { 'load_address' : 0x20000000,
                                   0x462c9b00, 0x6902481b, 0x40102080, 0xd1012880, 0xff86f7ff, 0x4817bf00, 0x07f068c6, 0xd1fa0fc0, 
                                   0x4814e01b, 0x20016902, 0x48124302, 0x88206102, 0xbf008018, 0x68c6480f, 0x0fc007f0, 0x8820d1fa, 
                                   0x42888819, 0x480bd006, 0x08526902, 0x61020052, 0xbdfe2001, 0x1ca41c9b, 0x98011c7f, 0x42b80840, 
-                                  0x4804d8df, 0x08526902, 0x61020052, 0xe7f02000, 0x45670123, 0x40022000, 0xcdef89ab, 0x00000000, 
+                                  0x4804d8df, 0x08526902, 0x61020052, 0xe7f02000, 0x45670123, 0x40022000, 0xcdef89ab, 0x00000000,
                                 ],
                'pc_init'          : 0x2000002F,
                'pc_eraseAll'      : 0x20000043,
@@ -59,39 +57,33 @@ FLASH_ALGO = { 'load_address' : 0x20000000,
                'pc_program_page'  : 0x200000F7,
                'static_base'      : 0x200001A0,
                'begin_data'       : 0x20000400, # Analyzer uses a max of 256 B data (64 pages * 4 bytes / page)
-               'page_buffers'     : 0x20000400, # no double buffer
-               'begin_stack'      : 0x20000A00,
+               'page_buffers'     : [0x20000400, 0x20000C00],   # Enable double buffering
+               'begin_stack'      : 0x20001400,
                'min_program_length' : 2,
                'analyzer_supported' : True,
-               'analyzer_address' : 0x20000A00 # Analyzer, 0x20000A00--0x20001000
+               'analyzer_address' : 0x20001800 # Analyzer 0x20001800..0x20001C00
               };
 
 
-class STM32F031E6(CoreSightTarget):
+class STM32F071CB(CoreSightTarget):
 
-    memoryMap = MemoryMap(
-        FlashRegion(    start=0x08000000,  length=0x8000,      blocksize=0x400, is_boot_memory=True,
-            algo=FLASH_ALGO),
-        RamRegion(      start=0x20000000,  length=0x1000)
+    VENDOR = "STMicroelectronics"
+
+    MEMORY_MAP = MemoryMap(
+        FlashRegion(    start=0x08000000,  length=0x20000,      blocksize=0x800, 
+                                                                is_boot_memory=True,
+                                                                algo=FLASH_ALGO),
+        RamRegion(      start=0x20000000,  length=0x4000)
         )
 
     def __init__(self, link):
-        super(STM32F031E6, self).__init__(link, self.memoryMap)
-        self._svd_location = SVDFile(vendor="STMicro", filename="STM32F0xx.svd", is_local=False)
+        super(STM32F071CB, self).__init__(link, self.MEMORY_MAP)
+        self._svd_location = SVDFile.from_builtin("STM32F0x1.svd")
 
-    def create_init_sequence(self):
-        seq = super(STM32F031E6, self).create_init_sequence()
-
-        seq.insert_after('create_cores',
-            ('setup_dbgmcu', self.setup_dbgmcu)
-            )
-
-        return seq
-        
-    def setup_dbgmcu(self):
-        logging.debug('stm32f031e6 init')
-        enclock = self.read_memory(RCC_APB2ENR_CR)
+    def post_connect_hook(self):
+        logging.debug('stm32f071cb init')
+        enclock = self.read32(RCC_APB2ENR_CR)
         enclock |= RCC_APB2ENR_DBGMCU
-        self.write_memory(RCC_APB2ENR_CR, enclock)
-        self.write_memory(DBGMCU_APB1_CR, DBGMCU_APB1_VAL)
-        self.write_memory(DBGMCU_APB2_CR, DBGMCU_APB2_VAL)
+        self.write32(RCC_APB2ENR_CR, enclock)
+        self.write32(DBGMCU_APB1_CR, DBGMCU_APB1_VAL)
+        self.write32(DBGMCU_APB2_CR, DBGMCU_APB2_VAL)

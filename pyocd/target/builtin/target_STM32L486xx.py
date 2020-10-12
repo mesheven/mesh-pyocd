@@ -15,9 +15,10 @@
  limitations under the License.
 """
 
-from ..flash.flash import Flash
-from ..core.coresight_target import (SVDFile, CoreSightTarget)
-from ..core.memory_map import (FlashRegion, RamRegion, MemoryMap)
+from ...flash.flash import Flash
+from ...coresight.coresight_target import CoreSightTarget
+from ...core.memory_map import (FlashRegion, RamRegion, MemoryMap)
+from ...debug.svd.loader import SVDFile
 import logging
 
 
@@ -67,29 +68,24 @@ FLASH_ALGO = { 'load_address' : 0x20000000,
 
 class STM32L486JG(CoreSightTarget):
 
-    memoryMap = MemoryMap(
-        FlashRegion(    start=0x08000000,  length=0x100000,      blocksize=0x0800, is_boot_memory=True,
-            algo=FLASH_ALGO),
+    VENDOR = "STMicroelectronics"
+    
+    MEMORY_MAP = MemoryMap(
+        FlashRegion(    start=0x08000000,  length=0x100000,     blocksize=0x0800,
+                                                                is_boot_memory=True,
+                                                                algo=FLASH_ALGO),
         RamRegion(      start=0x20000000,  length=0x20000)
         )
 
     def __init__(self, link):
-        super(STM32L486JG, self).__init__(link, self.memoryMap)
-        self._svd_location = SVDFile(vendor="STMicro", filename="STM32F0xx.svd", is_local=False)
+        super(STM32L486JG, self).__init__(link, self.MEMORY_MAP)
+        self._svd_location = SVDFile.from_builtin("STM32L4x6.svd")
 
-    def create_init_sequence(self):
-        seq = super(STM32L486JG, self).create_init_sequence()
-
-        seq.insert_after('create_cores',
-            ('setup_dbgmcu', self.setup_dbgmcu)
-            )
-
-        return seq
-        
-    def setup_dbgmcu(self):
+       
+    def post_connect_hook(self):
         logging.debug('stm32l486jg init')
-        self.write_memory(DBGMCU_CR, DBGMCU_VAL)
-        self.write_memory(DBGMCU_APB1_CR1, DBGMCU_APB1_VAL1)
-        self.write_memory(DBGMCU_APB1_CR2, DBGMCU_APB1_VAL2)       
-        self.write_memory(DBGMCU_APB2_CR, DBGMCU_APB2_VAL)        
+        self.write32(DBGMCU_CR, DBGMCU_VAL)
+        self.write32(DBGMCU_APB1_CR1, DBGMCU_APB1_VAL1)
+        self.write32(DBGMCU_APB1_CR2, DBGMCU_APB1_VAL2)       
+        self.write32(DBGMCU_APB2_CR, DBGMCU_APB2_VAL)        
 

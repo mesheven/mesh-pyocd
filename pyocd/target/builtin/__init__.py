@@ -107,6 +107,16 @@ from . import target_HC32L07x
 from . import target_MPS3_AN522
 from . import target_MPS3_AN540
 
+from . import target_LPC11U35
+from . import target_STM32F031xx
+from . import target_STM32F051xx
+from . import target_STM32F071xx
+from . import target_STM32F103xx
+from . import target_STM32F301xx
+from . import target_STM32F405xx
+from . import target_STM32L486xx
+
+
 ## @brief Dictionary of all builtin targets.
 BUILTIN_TARGETS = {
           'mps3_an522': target_MPS3_AN522.AN522,
@@ -160,8 +170,8 @@ BUILTIN_TARGETS = {
           'nrf51': target_nRF51822_xxAA.NRF51,
           'nrf52': target_nRF52832_xxAA.NRF52832,
           'nrf52840' : target_nRF52840_xxAA.NRF52840,
-          'stm32f103rc': target_STM32F103RC.STM32F103RC,
-          'stm32f051': target_STM32F051T8.STM32F051,
+          #'stm32f103rc': target_STM32F103RC.STM32F103RC,
+          #'stm32f051': target_STM32F051T8.STM32F051,
           'stm32f412xe' : target_STM32F412xx.STM32F412xE,
           'stm32f412xg' : target_STM32F412xx.STM32F412xG,
           'stm32f429xg' : target_STM32F429xx.STM32F429xG,
@@ -234,4 +244,14 @@ BUILTIN_TARGETS = {
           'hc32l072' : target_HC32L07x.HC32L072,
           'hc32l073' : target_HC32L07x.HC32L073,
           'hc32f072' : target_HC32L07x.HC32F072,
+          
+          'lpc11u35'  : target_LPC11U35.LPC11U35,
+          'stm32f031' : target_STM32F031xx.STM32F031E6,
+          'stm32f051' : target_STM32F051xx.STM32F051T8,
+          'stm32f071' : target_STM32F071xx.STM32F071CB,
+          'stm32f103' : target_STM32F103xx.STM32F103RC,
+          'stm32f301' : target_STM32F301xx.STM32F301K8,
+          'stm32f405' : target_STM32F405xx.STM32F405OG,
+          'stm32f415' : target_STM32F405xx.STM32F415OG,
+          'stm32l486' : target_STM32L486xx.STM32L486JG,          
          }
